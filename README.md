@@ -13,7 +13,7 @@ model's original text encoder in the **ggk** engine. Two trainer packs ship:
   recipe); the adapter pairs with the unchanged
   `mmproj-qwen3vl-4b-it-f16.gguf` vision encoder for editing and text-to-image.
 
-Both packs train against `pig_clip-f16.gguf` as the student.
+Both packs train against `pig_clip-f16.gguf` (get it [here](https://huggingface.co/gguf-org/trainer/blob/main/pig_clip-f16.gguf)) as the student.
 
 ```bash
 pip install gguf-trainer

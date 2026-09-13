@@ -1,4 +1,4 @@
-# gguf-trainer
+# trainer
 
 A trainer GUI for **pig_clip adapters**: small bridge networks that let
 `pig_clip` (native train/fine-tune shipped as a GGUF) stand in for a diffusion

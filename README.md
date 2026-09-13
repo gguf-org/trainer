@@ -27,6 +27,8 @@ The GUI runs in your browser against a local backend, in the style of the
 ggk diffuser GUI. Nothing is uploaded: models, datasets and outputs are
 addressed by filesystem path through the built-in file browser.
 
+![screenshot](https://raw.githubusercontent.com/gguf-org/ggk/master/media/trainer1.png)
+
 ## What the GUI does
 
 **Setup tab** — everything a run needs, in one project folder:
@@ -107,6 +109,8 @@ gguf-trainer stop   --project ~/gguf-trainer/projects/llada_adapter   # saves, t
 gguf-trainer status --project ~/gguf-trainer/projects/llada_adapter
 gguf-trainer download --project ~/gguf-trainer/projects/llada_adapter   # fetch missing materials
 ```
+
+![screenshot](https://raw.githubusercontent.com/gguf-org/ggk/master/media/trainer2.png)
 
 ## The LLaDA-Image pack
 

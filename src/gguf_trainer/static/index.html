@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GGUF</title>
+  <link rel="icon" type="image/png" href="logo.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- Top bar -->
+  <div id="topbar">
+    <span class="logo">Trainer <span id="app-version">–</span></span>
+    <nav id="tabs">
+      <button class="tab active" data-tab="setup">Setup</button>
+      <button class="tab" data-tab="train">Train</button>
+      <button class="tab" data-tab="hardware">Hardware</button>
+      <button class="tab" data-tab="logs">Logs</button>
+      <button class="tab" data-tab="output">Output</button>
+    </nav>
+    <span style="flex:1"></span>
+    <span id="gen-status"><span class="dot" id="status-dot"></span><span id="status-label">No project</span></span>
+    <button id="stop-btn" class="btn btn-danger" style="display:none">Stop</button>
+    <button id="theme-btn" title="Toggle dark/light mode">
+      <svg id="theme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none">
+        <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/>
+        <line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/>
+        <line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+      </svg>
+      <svg id="theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+    </button>
+  </div>
+
+  <div id="notice-banner" class="banner banner-warn" style="display:none"><span id="notice-text"></span><button class="banner-close" id="notice-close">✕</button></div>
+  <div id="error-banner" class="banner banner-error" style="display:none">
+    <span id="error-text"></span>
+    <button class="banner-close" id="error-close">✕</button>
+  </div>
+
+  <div id="content">
+
+    <!-- ══ Setup tab ══ -->
+    <div class="tab-page" id="page-setup">
+
+      <!-- Project -->
+      <section class="card">
+        <div class="card-head"><h3>Project</h3><span class="badge">required</span>
+          <span style="flex:1"></span><button class="btn btn-small" id="project-new-toggle">+ New project</button></div>
+        <div class="field-row">
+          <span class="flag-label">project</span>
+          <div class="path-box"><span class="path-text placeholder" id="project-path-text">Open a project folder…</span></div>
+          <button class="btn" id="project-open">Open</button>
+        </div>
+        <p class="hint">A project is one folder holding the downloaded materials, the corpus, the precomputed shards, checkpoints and the exported GGUF. Everything resumes from that folder after a reboot.</p>
+        <div id="project-new" style="display:none">
+          <div class="grid2" style="margin-top:10px">
+            <label class="field-label">Adapter name<input type="text" id="new-name" placeholder="llada_adapter"></label>
+            <label class="field-label">Trainer pack<select id="new-pack"></select></label>
+          </div>
+          <div class="field-row"><span class="flag-label">projects root</span>
+            <div class="path-box"><span class="path-text" id="new-root-text"></span></div>
+            <button class="btn" id="new-root-browse">Browse</button>
+            <button class="btn btn-primary" id="project-create">Create</button></div>
+          <p class="hint" id="pack-desc"></p>
+        </div>
+      </section>
+
+      <div id="setup-body" style="display:none">
+
+      <!-- Materials -->
+      <section class="card">
+        <div class="card-head"><h3>Materials</h3><span class="badge">teacher · student · datasets</span>
+          <span style="flex:1"></span>
+          <button class="btn btn-small" id="materials-refresh" title="Re-check the disk (and the current directory / other projects) for the files">Refresh</button>
+          <button class="btn btn-small btn-primary" id="materials-download-all" disabled
+                  title="Download every material that is not on disk yet. Files already present are skipped; interrupted downloads continue.">Download missing</button></div>
+        <p class="hint" id="pack-summary"></p>
+        <p class="hint" id="materials-summary"></p>
+        <div id="materials-list"></div>
+        <div class="field-row" style="margin-top:12px">
+          <span class="flag-label">HF token</span>
+          <input type="text" data-cfg="hf_token" placeholder="optional, for gated repos / higher rate limits" style="flex:1">
+        </div>
+      </section>
+
+      <!-- Corpus -->
+      <section class="card">
+        <div class="card-head"><h3>Corpus</h3><span class="badge" id="corpus-badge">text prompts</span>
+          <span style="flex:1"></span><button class="btn btn-small" id="corpus-build">Prepare corpus now</button></div>
+        <div class="field-row" id="corpus-mode-row">
+          <span class="flag-label">source</span>
+          <select data-cfg="corpus.mode" class="flag-select">
+            <option value="presets">public prompt datasets (+ local files)</option>
+            <option value="files">my own train.txt / val.txt</option>
+          </select>
+        </div>
+        <div id="corpus-images-box" style="display:none">
+          <div class="card-head" style="border:none;padding-bottom:0"><h4>Image datasets</h4>
+            <span class="hint-inline">downloaded as materials; instructions are synthesized from the captions</span></div>
+          <div id="corpus-image-presets" class="check-grid"></div>
+          <div class="card-head" style="border:none;padding-bottom:0;margin-top:8px"><h4>Extra image folders</h4>
+            <span class="hint-inline">jpg/png files, optional &lt;name&gt;.txt caption next to each image</span>
+            <span style="flex:1"></span><button class="btn btn-small" id="corpus-add-folder">+ Add folder</button></div>
+          <div id="corpus-image-folders"></div>
+          <div class="grid4" style="margin-top:10px">
+            <label class="field-label">Image samples (train)<input type="number" data-cfg="corpus.n_image" min="0" step="1000"></label>
+            <label class="field-label">Two-image samples<input type="number" data-cfg="corpus.n_two" min="0" step="500"></label>
+            <label class="field-label">Val image samples<input type="number" data-cfg="corpus.n_val_image" min="0" step="64"></label>
+            <label class="field-label">Text-only samples (train / val)<span style="display:flex;gap:6px"><input type="number" data-cfg="corpus.n_text" min="0" step="1000"><input type="number" data-cfg="corpus.n_val_text" min="0" step="64"></span></label>
+          </div>
+          <div class="card-head" style="border:none;padding-bottom:0;margin-top:8px"><h4>Text-only prompts</h4>
+            <span class="hint-inline">for the text-to-image template share; the same public prompt datasets / files</span></div>
+        </div>
+        <div id="corpus-presets-box">
+          <div id="corpus-presets" class="check-grid"></div>
+          <div class="card-head" style="border:none;padding-bottom:0;margin-top:8px"><h4>Extra local prompt files</h4>
+            <span class="hint-inline">one prompt per line, or .jsonl with a "text" field</span>
+            <span style="flex:1"></span><button class="btn btn-small" id="corpus-add-file">+ Add file</button></div>
+          <div id="corpus-files"></div>
+          <div class="grid4" style="margin-top:10px">
+            <label class="field-label corpus-text-only">Train prompts<input type="number" data-cfg="corpus.n_train" min="100" step="1000"></label>
+            <label class="field-label corpus-text-only">Val prompts<input type="number" data-cfg="corpus.n_val" min="16" step="64"></label>
+            <label class="field-label">Empty fraction<input type="number" data-cfg="corpus.empty_frac" min="0" max="0.2" step="0.005"></label>
+            <label class="field-label">Seed<input type="number" data-cfg="corpus.seed"></label>
+          </div>
+          <div class="grid2" style="margin-top:10px">
+            <label class="field-label">Min chars<input type="number" data-cfg="corpus.min_chars" min="1"></label>
+            <label class="field-label">Max chars<input type="number" data-cfg="corpus.max_chars" min="16"></label>
+          </div>
+        </div>
+        <div id="corpus-files-box" style="display:none">
+          <div class="field-row"><span class="flag-label">train.txt</span>
+            <div class="path-box"><span class="path-text placeholder" data-cfg-path="corpus.train_file" data-kind="text">Training prompts, one per line…</span></div>
+            <button class="btn browse-btn" data-for="corpus.train_file">Browse</button></div>
+          <div class="field-row"><span class="flag-label">val.txt</span>
+            <div class="path-box"><span class="path-text placeholder" data-cfg-path="corpus.val_file" data-kind="text">Validation prompts…</span></div>
+            <button class="btn browse-btn" data-for="corpus.val_file">Browse</button></div>
+        </div>
+        <p class="hint" id="corpus-hint"></p>
+      </section>
+
+      <!-- Precompute -->
+      <section class="card">
+        <details>
+        <summary class="card-head collapsible"><h3>Precompute</h3><span class="badge">teacher + student</span><span class="summary-note" id="precompute-summary"></span><span class="chev">▾</span></summary>
+        <div class="card-body">
+          <div class="grid4">
+            <label class="field-label">Device<select data-cfg="precompute.device" id="precompute-device"><option value="auto">auto</option></select></label>
+            <label class="field-label">Shard size<input type="number" data-cfg="precompute.shard_size" min="16" step="64"></label>
+            <label class="field-label">Val shard size<input type="number" data-cfg="precompute.val_shard_size" min="16" step="64"></label>
+            <label class="field-label">Student dtype<select data-cfg="precompute.student_dtype"><option value="bf16">bf16</option><option value="f16">f16</option><option value="f32">f32</option></select></label>
+          </div>
+          <div class="grid4">
+            <label class="field-label">Teacher batch (0 = auto)<input type="number" data-cfg="precompute.teacher_batch" min="0"></label>
+            <label class="field-label">Token budget (0 = auto)<input type="number" data-cfg="precompute.tok_budget" min="0" step="512"></label>
+            <label class="field-label">Student batch (0 = auto)<input type="number" data-cfg="precompute.student_batch" min="0"></label>
+            <label class="field-label" id="precompute-placement-field">Teacher placement<select data-cfg="precompute.placement">
+              <option value="sequential">sequential — fill the chosen GPU first (recommended)</option>
+              <option value="balanced">balanced — spread evenly over all GPUs</option>
+            </select></label>
+            <label class="field-label precompute-vision" style="display:none">Teacher mode<select data-cfg="precompute.teacher_mode">
+              <option value="auto">auto — resident when it fits the GPU budget, else streamed</option>
+              <option value="gpu">gpu — text stack resident on the GPU</option>
+              <option value="offload">offload — weights in RAM, streamed through the GPU</option>
+            </select></label>
+          </div>
+          <div class="grid4 precompute-vision" style="display:none">
+            <label class="field-label">Student token budget (0 = auto)<input type="number" data-cfg="precompute.student_tok_budget" min="0" step="1024"></label>
+            <label class="field-label">Vision token budget (0 = auto)<input type="number" data-cfg="precompute.vis_tok_budget" min="0" step="256"></label>
+          </div>
+          <div class="grid2">
+            <label class="field-label">Teacher GPU memory (GiB, 0 = auto)<input type="number" data-cfg="precompute.gpu_mem_gib" min="0" step="0.5"></label>
+            <label class="field-label">Teacher CPU memory (GiB, 0 = auto)<input type="number" data-cfg="precompute.cpu_mem_gib" min="0" step="1"></label>
+          </div>
+          <p class="hint" id="precompute-hint"></p>
+          <p class="hint" id="shard-estimate"></p>
+          <label class="toggle-row"><input type="checkbox" id="mock-teacher"> Dev smoke test: mock teacher (synthetic targets, no download — the adapter is meaningless)</label>
+        </div>
+        </details>
+      </section>
+
+      <!-- Training -->
+      <section class="card">
+        <details open>
+        <summary class="card-head collapsible"><h3>Training</h3><span class="badge">adapter</span><span class="summary-note" id="train-summary"></span><span class="chev">▾</span></summary>
+        <div class="card-body">
+          <div class="grid4">
+            <label class="field-label">Width<input type="number" data-cfg="train.width" min="64" step="64"></label>
+            <label class="field-label">Depth<input type="number" data-cfg="train.depth" min="1"></label>
+            <label class="field-label">Steps<input type="number" data-cfg="train.steps" min="1" step="500"></label>
+            <label class="field-label">Batch size<input type="number" data-cfg="train.batch_size" min="1"></label>
+          </div>
+          <div class="grid4">
+            <label class="field-label">Learning rate<input type="number" data-cfg="train.lr" step="0.00001"></label>
+            <label class="field-label">Warmup steps<input type="number" data-cfg="train.warmup" min="0"></label>
+            <label class="field-label">Weight decay<input type="number" data-cfg="train.weight_decay" step="0.005"></label>
+            <label class="field-label">Grad clip<input type="number" data-cfg="train.grad_clip" step="0.1"></label>
+          </div>
+          <div class="grid4">
+            <label class="field-label">Cosine weight<input type="number" data-cfg="train.cos_weight" step="0.1"></label>
+            <label class="field-label">Sigma floor<input type="number" data-cfg="train.sigma_floor" step="0.01"></label>
+            <label class="field-label">Grad checkpoint<select data-cfg="train.grad_checkpoint"><option value="auto">auto (&lt;12 GB VRAM)</option><option value="on">on</option><option value="off">off</option></select></label>
+            <label class="field-label">Device<select data-cfg="train.device" id="train-device"><option value="auto">auto</option></select></label>
+          </div>
+          <div class="grid4">
+            <label class="field-label">Log every<input type="number" data-cfg="train.log_every" min="1"></label>
+            <label class="field-label">Validate every<input type="number" data-cfg="train.val_every" min="1"></label>
+            <label class="field-label">Checkpoint every<input type="number" data-cfg="train.save_every" min="1"></label>
+            <label class="field-label">Seed<input type="number" data-cfg="train.seed"></label>
+          </div>
+          <p class="hint" id="train-hint"></p>
+        </div>
+        </details>
+      </section>
+
+      <!-- Output -->
+      <section class="card">
+        <div class="card-head"><h3>Output</h3><span class="badge">f16 GGUF</span></div>
+        <div class="grid2">
+          <label class="field-label">Adapter name<input type="text" data-cfg="name"></label>
+          <label class="field-label">&nbsp;<span class="hint-inline" id="output-name-preview"></span></label>
+        </div>
+        <div class="field-row"><span class="flag-label">output dir</span>
+          <div class="path-box"><span class="path-text placeholder" data-cfg-path="export.output_dir" data-kind="dir">Default: the folder containing the project folder (next to it)</span><button class="clear-btn" data-clear="export.output_dir">✕</button></div>
+          <button class="btn browse-btn" data-for="export.output_dir" data-kind="dir">Browse</button></div>
+        <div class="field-row"><span class="flag-label">also copy to</span>
+          <div class="path-box"><span class="path-text placeholder" data-cfg-path="export.copy_to" data-kind="dir">Optional: your ggk model folder</span><button class="clear-btn" data-clear="export.copy_to">✕</button></div>
+          <button class="btn browse-btn" data-for="export.copy_to" data-kind="dir">Browse</button></div>
+        <label class="toggle-row" id="export-sigvq-row"><input type="checkbox" data-cfg="export.export_sigvq"> Also export the paired vision encoder GGUF (SigVQ, for <code>--llm_vision</code>) when downloaded</label>
+        <label class="toggle-row"><input type="checkbox" data-cfg="export.run_eval"> Evaluate the exported GGUF on the val shards</label>
+        <label class="toggle-row"><input type="checkbox" data-cfg="auto_resume"> Resume automatically when <code>gguf-trainer --auto-resume</code> launches after a reboot</label>
+      </section>
+
+      <div id="setup-bar">
+        <button class="btn" id="save-btn">Save settings</button>
+        <span class="hint-inline" id="save-note"></span>
+        <span style="flex:1"></span>
+        <button class="btn btn-primary btn-big" id="start-btn">Start pipeline</button>
+      </div>
+
+      </div><!-- /setup-body -->
+    </div>
+
+    <!-- ══ Train tab ══ -->
+    <div class="tab-page" id="page-train" style="display:none">
+      <section class="card">
+        <div class="card-head"><h3>Pipeline</h3><span class="badge" id="train-project-badge">no project</span>
+          <span style="flex:1"></span>
+          <button class="btn btn-small btn-primary" id="train-start">Start / Resume</button>
+          <button class="btn btn-small btn-danger" id="train-stop" style="display:none">Stop</button>
+          <select id="reset-select" class="flag-select" style="max-width:none">
+            <option value="">Reset…</option>
+            <option value="train">training (checkpoints)</option>
+            <option value="shards">precomputed shards + training</option>
+            <option value="corpus">corpus + everything after</option>
+            <option value="state">status only (keep files)</option>
+          </select>
+        </div>
+        <div id="stage-strip"></div>
+        <p class="hint" id="stage-hint" style="display:none">Once training has produced <code>best.pt</code>, the <b>Export GGUF</b> and <b>Evaluate</b> boxes are clickable: they regenerate the GGUF / <code>eval.json</code> (kept in the project folder) from the checkpoint at any time, e.g. after the file was deleted.</p>
+        <div id="stage-detail" style="margin-top:12px">
+          <div class="progress-wrap"><div class="progress-bar" id="stage-bar"></div></div>
+          <div id="stage-text" class="hint"></div>
+        </div>
+        <div id="run-error" class="hint" style="color:var(--danger);display:none"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h3>Training metrics</h3><span class="summary-note" id="metrics-note"></span></div>
+        <div class="kv-grid" id="train-metrics"></div>
+        <canvas id="chart" height="220"></canvas>
+        <div class="legend"><span><i style="background:#4f6ef7"></i>loss</span><span><i style="background:#2f9e63"></i>cos</span><span><i style="background:#e0a52a"></i>val cos</span></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h3>Live hardware</h3><span class="summary-note" id="hw-live-note"></span></div>
+        <div class="kv-grid" id="hw-live"></div>
+      </section>
+    </div>
+
+    <!-- ══ Hardware tab ══ -->
+    <div class="tab-page" id="page-hardware" style="display:none">
+      <section class="card">
+        <div class="card-head"><h3>Hardware</h3>
+          <span style="flex:1"></span><button class="btn btn-small" id="hw-refresh">Refresh</button></div>
+        <div id="hw-info" class="kv-list"></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h3>Environment</h3></div>
+        <div id="env-info" class="kv-list"></div>
+      </section>
+    </div>
+
+    <!-- ══ Logs tab ══ -->
+    <div class="tab-page" id="page-logs" style="display:none">
+      <section class="card">
+        <div class="card-head"><h3>Pipeline log</h3><span class="summary-note" id="log-path"></span>
+          <span style="flex:1"></span>
+          <label class="toggle-row" style="padding:0"><input type="checkbox" id="log-follow" checked> follow</label>
+          <button class="btn btn-small" id="logs-refresh">Refresh</button>
+          <button class="btn btn-small" id="logs-clear">Clear view</button></div>
+        <pre id="log-view" class="log"></pre>
+      </section>
+    </div>
+
+    <!-- ══ Output tab ══ -->
+    <div class="tab-page" id="page-output" style="display:none">
+      <section class="card">
+        <div class="card-head"><h3>Exported files</h3><span class="summary-note" id="output-dir-note"></span>
+          <span style="flex:1"></span>
+          <button class="btn btn-small" id="output-export" style="display:none" title="Regenerate the adapter GGUF (and the evaluation) from checkpoints/best.pt">Export GGUF</button></div>
+        <div id="output-files"></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h3>Evaluation</h3><span class="summary-note" id="eval-note"></span></div>
+        <div id="eval-info" class="kv-list"></div>
+        <p class="hint" id="eval-hint"></p>
+      </section>
+      <section class="card">
+        <div class="card-head"><h3>Use it in ggk</h3><span style="flex:1"></span><button class="btn btn-small" id="copy-cmd">Copy</button></div>
+        <div class="cmd" id="cmd-preview"></div>
+        <p class="hint" id="output-hint"></p>
+      </section>
+    </div>
+
+  </div><!-- /content -->
+
+  <div id="statusbar">
+    <span id="sb-project" class="mono">(no project)</span>
+    <span class="sep">|</span><span id="sb-stage">–</span>
+    <span class="sep">|</span><span id="sb-progress">–</span>
+    <span style="flex:1"></span>
+    <span id="sb-status">Idle</span>
+  </div>
+</div><!-- /app -->
+
+<!-- File browse modal -->
+<div id="browse-overlay" class="modal-overlay">
+  <div class="modal modal-wide">
+    <div class="modal-title" id="browse-title">Select file</div>
+    <div class="modal-body">
+      <div class="path-input-row">
+        <input type="text" id="browse-path-input" class="modal-input" placeholder="/path/to/file or a directory" />
+        <button class="btn" id="browse-go-btn">Go</button>
+      </div>
+      <div class="browse-path" id="browse-current">—</div>
+      <ul class="browse-list" id="browse-list"></ul>
+    </div>
+    <div class="modal-footer">
+      <span class="modal-note">Files are referenced from this machine's disk — nothing is uploaded.</span>
+      <button class="btn btn-primary" id="browse-pick-dir-btn" style="display:none">Use this folder</button>
+      <button class="btn" id="browse-cancel-btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm dialog (replaces window.confirm) -->
+<div id="confirm-overlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal confirm-modal">
+    <div class="confirm-head">
+      <div class="confirm-icon" id="confirm-icon" aria-hidden="true"></div>
+      <div class="confirm-title" id="confirm-title">Are you sure?</div>
+    </div>
+    <div class="modal-body">
+      <p class="confirm-text" id="confirm-text"></p>
+      <ul class="confirm-list" id="confirm-list"></ul>
+      <p class="confirm-note" id="confirm-note"></p>
+    </div>
+    <div class="modal-footer confirm-footer">
+      <button class="btn" id="confirm-cancel">Cancel</button>
+      <button class="btn btn-primary" id="confirm-ok">Continue</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

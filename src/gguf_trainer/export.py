@@ -1,0 +1,128 @@
+"""Export stage: checkpoint -> f16 GGUF for ggk's --llm-adapter.
+
+Everything the engine needs is derived from tensor shapes (`adapter.query`
+[width, num_queries] selects the resampler variant, its absence the
+token-aligned one; `adapter.vision_proj.weight` selects the vision
+extension; head_dim 64).  Norms, biases, the query and vision_proj stay
+f32, other 2-D weights go f16.  A resampler trained on standardized targets
+has the standardization folded into out_proj so the engine emits
+teacher-scale rows:  W' = diag(sigma) W,  b' = sigma * b + mu.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import shutil
+
+import numpy as np
+import torch
+from gguf_connector.reader import GGUFReader
+from gguf_connector.writer import GGUFWriter
+
+from .adapter import KIND_RESAMPLER, KIND_TOKEN_VISION, AdapterConfig, build_adapter
+from .util import replace_atomic
+
+
+def load_folded_model(checkpoint: pathlib.Path):
+    ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cfg = AdapterConfig.from_ck(ck["config"])
+    model = build_adapter(cfg)
+    model.load_state_dict(ck["model"])
+    model.eval()
+    if ck.get("standardized"):
+        mu = ck["mu"].float()
+        sigma = ck["sigma"].float()
+        with torch.no_grad():
+            model.out_proj.weight.mul_(sigma[:, None])
+            model.out_proj.bias.mul_(sigma).add_(mu)
+    return model, cfg, ck
+
+
+def _keep_f32(name: str, a: np.ndarray) -> bool:
+    return a.ndim == 1 or name in ("query", "vision_proj.weight") or ".ln_" in name or name.startswith("ln_")
+
+
+def export_adapter(project, pack, log) -> pathlib.Path:
+    ckpt = project.checkpoints_dir / "best.pt"
+    if not ckpt.exists():
+        raise RuntimeError("no checkpoints/best.pt to export")
+    model, cfg, ck = load_folded_model(ckpt)
+    log(f"export: loaded {ckpt} (step {ck['step']}, {model.num_params() / 1e6:.1f}M params, kind {cfg.kind})")
+    out = project.adapter_path()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp")
+
+    w = GGUFWriter(str(tmp), "pig")
+    w.add_name(project.config["name"])
+    w.add_uint32("adapter.in_dim", cfg.in_dim)
+    w.add_uint32("adapter.out_dim", cfg.out_dim)
+    if cfg.kind == KIND_TOKEN_VISION:
+        w.add_uint32("adapter.vis_dim", cfg.vis_dim)
+    w.add_uint32("adapter.width", cfg.width)
+    w.add_uint32("adapter.depth", cfg.depth)
+    w.add_uint32("adapter.heads", cfg.heads)
+    if cfg.kind == KIND_RESAMPLER:
+        w.add_uint32("adapter.num_queries", cfg.num_queries)
+    w.add_uint32("adapter.trained_steps", int(ck["step"]))
+    w.add_string("adapter.pack", pack.id)
+    w.add_string("adapter.trainer", "gguf-trainer")
+    for k, v in pack.export_kv(project).items():
+        if isinstance(v, str):
+            w.add_string(k, v)
+        elif isinstance(v, bool):
+            w.add_bool(k, v)
+        elif isinstance(v, int):
+            w.add_uint32(k, v)
+        elif isinstance(v, float):
+            w.add_float32(k, v)
+    n_f16 = n_f32 = 0
+    for name, t in model.state_dict().items():
+        a = t.detach().cpu().float().numpy()
+        if _keep_f32(name, a):
+            w.add_tensor("adapter." + name, a.astype(np.float32))
+            n_f32 += 1
+        else:
+            w.add_tensor("adapter." + name, a.astype(np.float16))
+            n_f16 += 1
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    r = GGUFReader(str(tmp))
+    names = {t.name for t in r.tensors}
+    assert len(r.tensors) == n_f16 + n_f32, "read-back tensor count mismatch"
+    if cfg.kind == KIND_TOKEN_VISION:
+        assert "adapter.query" not in names and {"adapter.skip.weight", "adapter.vision_proj.weight",
+                                                 "adapter.vis_in.weight"} <= names, "vision-ext layout"
+    else:
+        assert "adapter.query" in names, "resampler layout"
+    del r
+    replace_atomic(tmp, out)
+    log(f"export: wrote {out}: {n_f16} f16 + {n_f32} f32 tensors")
+    copy_to = (project.config.get("export") or {}).get("copy_to") or ""
+    if copy_to:
+        dst = pathlib.Path(copy_to).expanduser()
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(out, dst / out.name)
+        log(f"export: copied to {dst / out.name}")
+    return out
+
+
+def gguf_adapter_model(path: pathlib.Path):
+    """Rebuild the adapter from an exported GGUF (the engine's view of it):
+    the kind is read off the tensor names exactly like llm_adapter.hpp does."""
+    r = GGUFReader(str(path))
+    kv = {f.name: f.contents() for f in r.fields.values() if f.name.startswith("adapter.")}
+    sd = {}
+    for t in r.tensors:
+        shape = tuple(int(x) for x in reversed(t.shape))
+        sd[t.name[len("adapter."):]] = torch.from_numpy(np.asarray(t.data).astype(np.float32).reshape(shape).copy())
+    resampler = "query" in sd
+    cfg = AdapterConfig(in_dim=int(kv["adapter.in_dim"]), out_dim=int(kv["adapter.out_dim"]),
+                        width=int(kv["adapter.width"]), depth=int(kv["adapter.depth"]),
+                        num_queries=int(kv.get("adapter.num_queries", sd["query"].shape[0] if resampler else 0)),
+                        kind=KIND_RESAMPLER if resampler else KIND_TOKEN_VISION,
+                        vis_dim=0 if resampler else int(kv.get("adapter.vis_dim", sd["vision_proj.weight"].shape[1])))
+    model = build_adapter(cfg)
+    model.load_state_dict(sd)
+    return model.eval(), cfg, kv

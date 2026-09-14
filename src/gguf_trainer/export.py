@@ -7,12 +7,20 @@ extension; head_dim 64).  Norms, biases, the query and vision_proj stay
 f32, other 2-D weights go f16.  A resampler trained on standardized targets
 has the standardization folded into out_proj so the engine emits
 teacher-scale rows:  W' = diag(sigma) W,  b' = sigma * b + mu.
+
+The same writer serves the end-of-run export (best.pt -> <name>-f16.gguf)
+and the mid-run snapshots (best.pt or last.pt -> <name>-step<N>-f16.gguf,
+see snapshot.py).  Provenance KVs (adapter.trained_steps, planned_steps,
+checkpoint, val_cos, best_val_cos, snapshot) tell any reader how far along
+the run the file was taken; the engine ignores them.
 """
 
 from __future__ import annotations
 
+import math
 import pathlib
 import shutil
+from typing import Optional
 
 import numpy as np
 import torch
@@ -42,15 +50,31 @@ def _keep_f32(name: str, a: np.ndarray) -> bool:
     return a.ndim == 1 or name in ("query", "vision_proj.weight") or ".ln_" in name or name.startswith("ln_")
 
 
-def export_adapter(project, pack, log) -> pathlib.Path:
-    ckpt = project.checkpoints_dir / "best.pt"
+def checkpoint_file(project, checkpoint: str) -> pathlib.Path:
+    """'best' | 'last' -> checkpoints/<kind>.pt (must exist)."""
+    if checkpoint not in ("best", "last"):
+        raise ValueError(f"checkpoint must be 'best' or 'last', not {checkpoint!r}")
+    ckpt = project.checkpoints_dir / f"{checkpoint}.pt"
     if not ckpt.exists():
-        raise RuntimeError("no checkpoints/best.pt to export")
+        raise RuntimeError(f"no checkpoints/{checkpoint}.pt to export")
+    return ckpt
+
+
+def export_adapter(project, pack, log, checkpoint: str = "best", out: Optional[pathlib.Path] = None,
+                   snapshot: bool = False, copy: bool = True) -> pathlib.Path:
+    """Write the adapter GGUF from checkpoints/<checkpoint>.pt.  Default = the
+    pipeline's export stage (best.pt -> project.adapter_path(), copied to
+    export.copy_to).  Snapshots pass out=project.snapshot_path(step),
+    snapshot=True and skip the copy."""
+    ckpt = checkpoint_file(project, checkpoint)
     model, cfg, ck = load_folded_model(ckpt)
     log(f"export: loaded {ckpt} (step {ck['step']}, {model.num_params() / 1e6:.1f}M params, kind {cfg.kind})")
-    out = project.adapter_path()
+    out = pathlib.Path(out) if out is not None else project.adapter_path()
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".tmp")
+    planned = int((ck.get("train_config") or {}).get("steps") or project.config["train"]["steps"])
+    val = ck.get("val") or {}
+    val_cos = val.get("val_cos")
 
     w = GGUFWriter(str(tmp), "pig")
     w.add_name(project.config["name"])
@@ -64,6 +88,14 @@ def export_adapter(project, pack, log) -> pathlib.Path:
     if cfg.kind == KIND_RESAMPLER:
         w.add_uint32("adapter.num_queries", cfg.num_queries)
     w.add_uint32("adapter.trained_steps", int(ck["step"]))
+    w.add_uint32("adapter.planned_steps", planned)
+    w.add_string("adapter.checkpoint", checkpoint)
+    w.add_bool("adapter.snapshot", bool(snapshot))
+    if isinstance(val_cos, float) and math.isfinite(val_cos):
+        w.add_float32("adapter.val_cos", float(val_cos))
+    bvc = ck.get("best_val_cos")
+    if isinstance(bvc, float) and math.isfinite(bvc) and bvc > -1.0:
+        w.add_float32("adapter.best_val_cos", float(bvc))
     w.add_string("adapter.pack", pack.id)
     w.add_string("adapter.trainer", "gguf-trainer")
     for k, v in pack.export_kv(project).items():
@@ -98,9 +130,11 @@ def export_adapter(project, pack, log) -> pathlib.Path:
         assert "adapter.query" in names, "resampler layout"
     del r
     replace_atomic(tmp, out)
-    log(f"export: wrote {out}: {n_f16} f16 + {n_f32} f32 tensors")
+    log(f"export: wrote {out}: {n_f16} f16 + {n_f32} f32 tensors "
+        f"({checkpoint}.pt, step {ck['step']}/{planned}"
+        + (f", val cos {val_cos:.4f}" if isinstance(val_cos, float) and math.isfinite(val_cos) else "") + ")")
     copy_to = (project.config.get("export") or {}).get("copy_to") or ""
-    if copy_to:
+    if copy_to and copy:
         dst = pathlib.Path(copy_to).expanduser()
         dst.mkdir(parents=True, exist_ok=True)
         shutil.copy2(out, dst / out.name)

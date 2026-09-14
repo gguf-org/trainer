@@ -20,14 +20,16 @@ token-aligned vision packs:
 
 from __future__ import annotations
 
+import pathlib
 import time
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from .adapter import KIND_TOKEN_VISION
 from .devices import pick_device
-from .export import gguf_adapter_model, load_folded_model
+from .export import checkpoint_file, gguf_adapter_model, load_folded_model
 from .shards import ValSet
 from .util import write_json_atomic
 
@@ -37,12 +39,16 @@ def rms_norm(x, eps=1e-5):
 
 
 @torch.no_grad()
-def evaluate(project, pack, log) -> dict:
-    dev = pick_device(project.config["train"].get("device", "auto"))
-    gguf_path = project.adapter_path()
+def evaluate(project, pack, log, gguf_path: Optional[pathlib.Path] = None, checkpoint: str = "best",
+             out_path: Optional[pathlib.Path] = None, device: Optional[str] = None, write: bool = True) -> dict:
+    """Default = the pipeline's eval stage: adapter_path() vs best.pt ->
+    <project>/eval.json.  Snapshots evaluate their own GGUF against the
+    checkpoint it came from and keep the result in the manifest (write=False)."""
+    dev = pick_device(device or project.config["train"].get("device", "auto"))
+    gguf_path = pathlib.Path(gguf_path) if gguf_path is not None else project.adapter_path()
     model, cfg, kv = gguf_adapter_model(gguf_path)
     model.to(dev)
-    ck_model, _, ck = load_folded_model(project.checkpoints_dir / "best.pt")
+    ck_model, _, ck = load_folded_model(checkpoint_file(project, checkpoint))
     ck_model.to(dev)
     val = ValSet(str(project.shards_dir / "val"), int(project.config["train"]["batch_size"]))
     if cfg.kind == KIND_TOKEN_VISION:
@@ -50,9 +56,10 @@ def evaluate(project, pack, log) -> dict:
     else:
         res = _eval_resampler(model, ck_model, val, dev, ck["mu"].to(dev))
     res.update({"gguf": str(gguf_path), "kind": cfg.kind, "trained_steps": int(kv.get("adapter.trained_steps", 0)),
-                "time": time.time(), "config": cfg.to_dict()})
+                "checkpoint": checkpoint, "time": time.time(), "config": cfg.to_dict()})
     log("eval: " + ", ".join(f"{k} {v:.4f}" for k, v in res.items() if isinstance(v, float) and k != "time"))
-    write_json_atomic(project.eval_path(), res)
+    if write:
+        write_json_atomic(out_path if out_path is not None else project.eval_path(), res)
     return res
 
 

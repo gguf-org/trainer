@@ -18,7 +18,7 @@ ABSENCE of `query`; the vision extension by the presence of `vision_proj.weight`
     out = out_proj(ln_out(x)) + skip(h)     # width -> out_dim, plus a direct linear path
 
 v is the RAW mmproj embed at vision positions, so vision fidelity does not
-depend on what survives the student.  vis_in is bias-free (zero input
+depend on what survives the 0.6B student.  vis_in is bias-free (zero input
 -> zero contribution) and out_proj is zero-initialized (training starts
 from the best linear map of the student states).  The module also carries
 the FROZEN `vision_proj` [vis_dim -> in_dim] map the ENGINE applies to

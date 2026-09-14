@@ -14,7 +14,7 @@ The 4B mmproj stays exactly as the teacher uses it; the adapter owns the
 squares over the shared vocabulary, applied by the ENGINE to every mmproj
 embed before the student) and a trained `vis_in` that hands the adapter the
 RAW mmproj embeds, so vision fidelity does not depend on what survives the
-student.  Teacher tap: final norm (out_layers = {}), ggk drops
+0.6B student.  Teacher tap: final norm (out_layers = {}), ggk drops
 deepstack, all-equal M-RoPE == plain rope, nearest resize + CLIP norm.
 """
 

@@ -125,11 +125,32 @@ $('browse-overlay').addEventListener('mousedown', (e) => { if (e.target === $('b
 // ─── Confirm dialog ──────────────────────────────────────────────────────────
 // askConfirm({title, text, items, note, ok, kind}) -> Promise<boolean>.
 // kind: 'info' (blue) | 'warn' (amber) | 'danger' (red, destructive).
+// With `fields` ([{id, type: 'radio'|'checkbox', label, options: [{value, label, desc}], value}])
+// it resolves with {id: value, ...} on OK and null on cancel.
 
 let confirmResolve = null;
+let confirmFields = null;
 function askConfirm(opts) {
   return new Promise((resolve) => {
     confirmResolve = resolve;
+    confirmFields = opts.fields || null;
+    const fields = $('confirm-fields');
+    fields.innerHTML = '';
+    for (const f of (opts.fields || [])) {
+      const g = document.createElement('div');
+      g.className = 'field-group';
+      if (f.label) g.innerHTML = `<div class="group-label">${escapeHTML(f.label)}</div>`;
+      if (f.type === 'checkbox') {
+        g.innerHTML += `<label class="opt"><input type="checkbox" name="cf-${f.id}" ${f.value ? 'checked' : ''}>
+          <span>${escapeHTML(f.text || '')}${f.desc ? ' <span class="desc">' + escapeHTML(f.desc) + '</span>' : ''}</span></label>`;
+      } else {
+        for (const o of f.options) {
+          g.innerHTML += `<label class="opt"><input type="radio" name="cf-${f.id}" value="${escapeHTML(o.value)}" ${o.value === f.value ? 'checked' : ''} ${o.disabled ? 'disabled' : ''}>
+            <span>${escapeHTML(o.label)}${o.desc ? ' <span class="desc">' + escapeHTML(o.desc) + '</span>' : ''}</span></label>`;
+        }
+      }
+      fields.appendChild(g);
+    }
     const kind = opts.kind || 'info';
     const icon = $('confirm-icon');
     icon.className = 'confirm-icon ' + (kind === 'info' ? '' : kind);
@@ -158,6 +179,18 @@ function askConfirm(opts) {
 }
 function closeConfirm(result) {
   $('confirm-overlay').classList.remove('open');
+  if (confirmFields) {
+    let values = null;
+    if (result) {
+      values = {};
+      for (const f of confirmFields) {
+        if (f.type === 'checkbox') values[f.id] = $('confirm-fields').querySelector(`input[name="cf-${f.id}"]`).checked;
+        else { const el = $('confirm-fields').querySelector(`input[name="cf-${f.id}"]:checked`); values[f.id] = el ? el.value : f.value; }
+      }
+    }
+    result = values;
+    confirmFields = null;
+  }
   if (confirmResolve) { confirmResolve(result); confirmResolve = null; }
 }
 $('confirm-ok').onclick = () => closeConfirm(true);
@@ -600,6 +633,46 @@ async function stopPipeline() {
 }
 $('stop-btn').onclick = stopPipeline;
 $('train-stop').onclick = stopPipeline;
+
+// Snapshot export: the adapter at its current step -> <name>-step<N>-f16.gguf,
+// while training runs (the trainer saves the step first) or from the
+// checkpoint on disk after a stop. Training is never interrupted.
+function canSnapshot() {
+  return !!(project && !project.snapshot_blocker && !(project.snapshot_job && project.snapshot_job.status === 'running'));
+}
+async function exportSnapshot() {
+  if (!canSnapshot()) return;
+  const art = project.artifacts.train, tr = project.state.stages.train || {};
+  const running = project.runtime_status === 'running' && project.state.stage === 'train';
+  const liveStep = running && tr.step != null ? tr.step : art.step;
+  const fmtCk = (step, cos) => step != null ? `step ${step}` + (cos != null ? `, val cos ${fmtNum(cos)}` : '') : 'not saved yet';
+  const values = await askConfirm({
+    kind: 'info',
+    title: 'Export a snapshot of the adapter',
+    text: running
+      ? 'The trainer validates and saves the current step first, then the GGUF is written from it; training keeps running.'
+      : 'Writes the GGUF from the checkpoint on disk. Resume training later and take more snapshots to compare.',
+    fields: [
+      { id: 'checkpoint', type: 'radio', label: 'Checkpoint', value: 'last', options: [
+        { value: 'last', label: 'Latest step', desc: running ? `(around step ${liveStep != null ? liveStep : '?'} — saved on request)` : `(${fmtCk(art.step, art.last_val_cos)})`, disabled: !running && !art.has_last },
+        { value: 'best', label: 'Best validation score so far', desc: `(${fmtCk(art.best_step, art.best_val_cos)})`, disabled: !art.has_best && !running },
+      ] },
+      { id: 'eval', type: 'checkbox', text: 'Also evaluate the GGUF on the validation shards', value: false,
+        desc: running ? '(on the CPU while training owns the GPU — a few minutes)' : '(about a minute)' },
+    ],
+    items: [{ label: 'writes', value: `${project.config.name}-step<N>-f16.gguf in ${project.output_dir}` }],
+    note: 'Runs detached like a download; the file appears under Output › Snapshots with the step and its validation cosine. The final export at the end of the run is not affected.',
+    ok: 'Export snapshot',
+  });
+  if (!values) return;
+  try {
+    await api('/api/snapshot', { path: project.path, checkpoint: values.checkpoint, eval: !!values.eval });
+    showNotice(running ? 'Snapshot requested — the trainer saves the current step, then the GGUF is exported.' : 'Snapshot export started.');
+    await refreshProject(false);
+  } catch (e) { showError(e.message); }
+}
+$('train-snapshot').onclick = () => exportSnapshot().catch(e => showError(e.message));
+$('output-snapshot').onclick = () => exportSnapshot().catch(e => showError(e.message));
 $('reset-select').onchange = async () => {
   const what = $('reset-select').value;
   $('reset-select').value = '';
@@ -686,6 +759,14 @@ function renderPipeline() {
   $('output-export').style.display = re ? '' : 'none';
   $('output-export').textContent = art.export.done ? 'Re-export GGUF' : 'Export GGUF';
   $('stage-hint').style.display = re ? '' : 'none';
+  const snap = canSnapshot();
+  const snapPossible = snap || !!(art.train.has_last || art.train.has_best) || (runtime === 'running' && st.stage === 'train');
+  $('train-snapshot').style.display = snapPossible ? '' : 'none';
+  $('train-snapshot').disabled = !snap;
+  $('output-snapshot').style.display = snapPossible ? '' : 'none';
+  $('output-snapshot').disabled = !snap;
+  $('snapshot-hint').style.display = snapPossible ? '' : 'none';
+  renderSnapshotJob();
   const focus = st.stage && runtime === 'running' ? st.stage : (current || st.stage || 'corpus');
   const pr = stageProgress(focus, st.stages[focus], art[focus]);
   const bar = $('stage-bar');
@@ -852,6 +933,50 @@ function renderOutput() {
     $('eval-note').textContent = '';
   }
   $('cmd-preview').textContent = project.engine_command || '';
+  renderSnapshots();
+}
+
+function snapshotEvalKey(ev) {
+  if (!ev) return null;
+  const keys = (packInfo().eval_keys || []).filter(k => k in ev);
+  return keys[0] || Object.keys(ev).find(k => typeof ev[k] === 'number' && k.startsWith('cos')) || null;
+}
+function renderSnapshotJob() {
+  const job = project.snapshot_job || { status: 'none' };
+  const el = $('snapshot-job');
+  let text = '';
+  if (job.status === 'running') text = 'Snapshot export running: ' + (job.phase || 'starting') + ' (see snapshot.log)';
+  else if (job.status === 'failed') text = 'Last snapshot export failed: ' + (job.error || 'see snapshot.log');
+  else if (job.status === 'done' && job.path) text = `Last snapshot: ${filename(job.path)} (step ${job.step}${job.val_cos != null ? ', val cos ' + fmtNum(job.val_cos) : ''})`;
+  el.textContent = text;
+  el.style.display = text ? '' : 'none';
+  el.style.color = job.status === 'failed' ? 'var(--danger)' : '';
+}
+function renderSnapshots() {
+  const box = $('snapshot-table');
+  const snaps = project.snapshots || [];
+  const job = project.snapshot_job || { status: 'none' };
+  $('snapshots-note').textContent = job.status === 'running' ? 'exporting… ' + (job.phase || '') : (snaps.length ? `${snaps.length} snapshot${snaps.length > 1 ? 's' : ''}` : '');
+  if (!snaps.length) {
+    box.innerHTML = '<p class="hint">' + (project.snapshot_blocker && !(project.artifacts.train.has_last) ? 'No checkpoint yet — snapshots become available once the train stage has started.' : 'No snapshots yet. Press <b>Export snapshot</b> at any point of the run.') + '</p>';
+    return;
+  }
+  const planned = snaps[snaps.length - 1].planned_steps;
+  const rows = snaps.map(e => {
+    const key = snapshotEvalKey(e.eval);
+    const pct = e.planned_steps ? Math.round(100 * e.step / e.planned_steps) : null;
+    return `<tr>
+      <td class="num">${e.step}${pct != null ? ` <span class="tag">${pct}%</span>` : ''}${e.checkpoint === 'best' ? '<span class="tag best">best</span>' : ''}</td>
+      <td class="num">${e.val_cos != null ? fmtNum(e.val_cos) : '—'}</td>
+      <td class="num">${key ? `${fmtNum(e.eval[key])} <span class="tag">${escapeHTML(key)}</span>` : '—'}</td>
+      <td class="file" title="${escapeHTML(e.path)}">${escapeHTML(e.name || filename(e.path))}</td>
+      <td class="num">${humanSize(e.size || 0)}</td>
+      <td class="num">${new Date(e.time * 1000).toLocaleString()}</td>
+    </tr>`;
+  });
+  box.innerHTML = `<div style="overflow-x:auto"><table class="snap-table">
+    <thead><tr><th>step${planned ? ' / ' + planned : ''}</th><th>val cos</th><th>eval</th><th>file</th><th>size</th><th>exported</th></tr></thead>
+    <tbody>${rows.join('')}</tbody></table></div>`;
 }
 $('copy-cmd').onclick = () => {
   navigator.clipboard.writeText($('cmd-preview').textContent);
@@ -871,7 +996,8 @@ async function refreshProject(online) {
 
 function schedulePolling() {
   clearTimeout(pollTimer);
-  const downloading = (project.materials || []).some(m => m.job && m.job.status === 'running');
+  const downloading = (project.materials || []).some(m => m.job && m.job.status === 'running')
+    || (project.snapshot_job && project.snapshot_job.status === 'running');
   const running = project.runtime_status === 'running';
   if (!running && !downloading) { clearInterval(hwTimer); hwTimer = null; return; }
   pollTimer = setTimeout(async () => {

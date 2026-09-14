@@ -8,6 +8,9 @@
     gguf-trainer status --project DIR  print the project's stage status
     gguf-trainer start --project DIR --only export eval --force
                                        regenerate the GGUF (+ eval) from checkpoints/best.pt
+    gguf-trainer snapshot --project DIR [--checkpoint last|best] [--eval]
+                                       export the adapter at its CURRENT step as <name>-step<N>-f16.gguf,
+                                       while training runs (it saves the step first) or after a stop
     gguf-trainer download --project DIR [--id ID ...]
                                        fetch the materials the project still lacks (foreground, resumable)
 """
@@ -75,6 +78,23 @@ def _cmd_stop(args) -> int:
     return 0
 
 
+def _cmd_snapshot(args) -> int:
+    from .project import Project
+    from .snapshot import main, start_job
+
+    p = Project(args.project)
+    if not p.exists():
+        print(f"no project at {p.path}")
+        return 2
+    if args.detach:
+        st = start_job(p, args.checkpoint, do_eval=args.eval, fresh=not args.no_fresh, device=args.device)
+        print(f"snapshot job launched (pid {st.get('pid')}), logging to {p.snapshot_log_file}")
+        return 0
+    return main(["--project", str(p.path), "--checkpoint", args.checkpoint]
+                + (["--eval"] if args.eval else []) + (["--no-fresh"] if args.no_fresh else [])
+                + (["--device", args.device] if args.device else []) + ["--timeout", str(args.timeout)])
+
+
 def _cmd_status(args) -> int:
     from .project import STAGES, Project
 
@@ -89,6 +109,28 @@ def _cmd_status(args) -> int:
         info = st.get("stages", {}).get(s, {})
         print(f"  {s:18s} {'done' if art[s]['done'] else info.get('status', '-'):10s} "
               f"{json.dumps({k: v for k, v in info.items() if k in ('step', 'steps', 'done_shards', 'total_shards', 'val_cos', 'best_val_cos', 'error')})}")
+    tr = art["train"]
+    if tr["has_last"] or tr["has_best"]:
+        print(f"  checkpoints: last step {tr['step']}"
+              + (f" (val cos {tr['last_val_cos']:.4f})" if tr.get("last_val_cos") is not None else "")
+              + (f", best step {tr['best_step']} (val cos {tr['best_val_cos']:.4f})" if tr.get("best_step") is not None else ""))
+    snaps = p.snapshots()
+    if snaps:
+        print("  snapshots:")
+        for e in snaps:
+            ev = e.get("eval") or {}
+            key = next((k for k in ("cos_centered", "cos_slice", "cos") if k in ev), None)
+            vc = e.get("val_cos")
+            line = f"    step {e['step']:>7}/{e['planned_steps']}  {e['checkpoint']:4s}  "
+            line += f"val cos {vc:.4f}" if vc is not None else "val cos   -   "
+            if key:
+                line += f"  eval {key} {ev[key]:.4f}"
+            print(line + f"  {e['path']}")
+    job = p.snapshot_job_status()
+    if job["status"] == "running":
+        print(f"  snapshot job: running — {job.get('phase')}")
+    elif job["status"] == "failed":
+        print(f"  snapshot job: failed — {job.get('error')}")
     return 0
 
 
@@ -124,6 +166,18 @@ def main(argv=None) -> int:
     p_stop.add_argument("--project", required=True)
     p_stop.add_argument("--timeout", type=float, default=30.0)
     p_stop.set_defaults(func=_cmd_stop)
+    p_snap = sub.add_parser("snapshot", help="export the adapter at its current step as a step-tagged GGUF "
+                                             "(while training runs, or from the saved checkpoint after a stop)")
+    p_snap.add_argument("--project", required=True)
+    p_snap.add_argument("--checkpoint", choices=("last", "best"), default="last",
+                        help="last = newest step (default), best = best validation score so far")
+    p_snap.add_argument("--eval", action="store_true", help="also evaluate it on the val shards (result in snapshots.json)")
+    p_snap.add_argument("--no-fresh", action="store_true",
+                        help="while training runs: take the checkpoint on disk instead of asking the trainer to save the current step")
+    p_snap.add_argument("--device", default=None, help="eval device (default: cpu while the pipeline runs)")
+    p_snap.add_argument("--timeout", type=float, default=1800.0, help="seconds to wait for the trainer to save")
+    p_snap.add_argument("--detach", action="store_true", help="run in the background (like the GUI does)")
+    p_snap.set_defaults(func=_cmd_snapshot)
     p_status = sub.add_parser("status", help="print a project's stage status")
     p_status.add_argument("--project", required=True)
     p_status.set_defaults(func=_cmd_status)
@@ -134,7 +188,7 @@ def main(argv=None) -> int:
     p_dl.set_defaults(func=_cmd_download)
 
     argv_list = list(sys.argv[1:] if argv is None else argv)
-    if not argv_list or argv_list[0] not in ("serve", "run", "start", "stop", "status", "download", "-h", "--help", "--version"):
+    if not argv_list or argv_list[0] not in ("serve", "run", "start", "stop", "status", "download", "snapshot", "-h", "--help", "--version"):
         argv_list.insert(0, "serve")
     args = parser.parse_args(argv_list)
     return args.func(args)

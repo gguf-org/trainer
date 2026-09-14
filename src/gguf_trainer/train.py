@@ -15,6 +15,13 @@ frozen; the val report splits cosine into vision vs text positions.
 Stop-at-any-time: the STOP file or SIGINT/SIGTERM saves last.pt atomically
 after the current step; the next run resumes step, optimizer, best-val
 tracking and the exact stream position.
+
+Snapshot-at-any-time: the SNAPSHOT file (written by snapshot.py while the
+pipeline runs) makes the loop validate and save last.pt (and best.pt when
+the score improved) after the current step, then delete the file and keep
+training — so a GGUF of the adapter at exactly that step can be exported
+and tried in the engine without ending the run.  Every checkpoint's .json
+sidecar carries the step and its validation cosine for the manifest.
 """
 
 from __future__ import annotations
@@ -175,6 +182,7 @@ def train(project, pack, log, report, should_stop) -> str:
         t = (step - warmup) / max(1, steps - warmup)
         return lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(t, 1.0))))
 
+    project.clear_snapshot()       # a request left over from an earlier run
     start_step = 0
     best_val_cos = -1.0
     stream_state = None
@@ -224,25 +232,44 @@ def train(project, pack, log, report, should_stop) -> str:
         logw.writerow(["step", "loss", "rel_mse", "cos", "val_rel_mse", "val_cos", "val_cos_vis", "val_cos_txt",
                        "lr", "prompts_per_s", "time"])
 
+    val = {"val_rel_mse": float("nan"), "val_cos": float("nan")}
+    val_step = None                # the step `val` was measured at
+
     def save(step, name):
         path = out_dir / name
         tmp = out_dir / (name + ".tmp")
         torch.save({"config": cfg.to_dict(), "model": adapter.state_dict(), "opt": opt.state_dict(),
                     "step": step, "train_config": dict(tc), "best_val_cos": best_val_cos,
                     "stream_state": stream.state(), "torch_rng": torch.get_rng_state(),
-                    "mu": mu, "sigma": sigma_f, "standardized": not token_aligned, "pack": pack.id}, tmp)
+                    "mu": mu, "sigma": sigma_f, "standardized": not token_aligned, "pack": pack.id,
+                    "val": dict(val) if val_step == step else None}, tmp)
         with open(tmp, "rb+") as f:
             os.fsync(f.fileno())
         replace_atomic(tmp, path)
+        # sidecar for the GUI / snapshot manifest (no torch needed to read it);
+        # val_cos is the score of THIS checkpoint when it was validated at its step
+        vc = val["val_cos"] if val_step == step and val["val_cos"] == val["val_cos"] else None
         write_json_atomic(out_dir / (name.replace(".pt", ".json")),
-                          {"step": step, "best_val_cos": best_val_cos, "steps": steps, "time": time.time()})
+                          {"step": step, "best_val_cos": best_val_cos, "steps": steps, "val_cos": vc,
+                           "val_step": val_step, "time": time.time()})
+
+    def run_validation(step):
+        nonlocal val, val_step, best_val_cos
+        val = validate_fn()
+        val_step = step
+        if val["val_cos"] > best_val_cos:
+            best_val_cos = val["val_cos"]
+            save(step, "best.pt")
+        extra = (f" (vis {val['val_cos_vis']:.4f} txt {val['val_cos_txt']:.4f})"
+                 if "val_cos_vis" in val else "")
+        log(f"  val @ {step}: rel_mse {val['val_rel_mse']:.4f} cos {val['val_cos']:.4f}{extra} "
+            f"(best {best_val_cos:.4f})")
 
     adapter.train()
     t_log = time.time()
     t_start = time.time()
     n_prompts = 0
     steps_done_here = 0
-    val = {"val_rel_mse": float("nan"), "val_cos": float("nan")}
     step = start_step
     stopped = False
     for step in range(start_step, steps):
@@ -257,15 +284,9 @@ def train(project, pack, log, report, should_stop) -> str:
         n_prompts += batch["target"].shape[0]
         steps_done_here += 1
 
-        if (step + 1) % val_every == 0 or step + 1 == steps:
-            val = validate_fn()
-            if val["val_cos"] > best_val_cos:
-                best_val_cos = val["val_cos"]
-                save(step + 1, "best.pt")
-            extra = (f" (vis {val['val_cos_vis']:.4f} txt {val['val_cos_txt']:.4f})"
-                     if "val_cos_vis" in val else "")
-            log(f"  val @ {step + 1}: rel_mse {val['val_rel_mse']:.4f} cos {val['val_cos']:.4f}{extra} "
-                f"(best {best_val_cos:.4f})")
+        snapshot = project.snapshot_requested()
+        if (step + 1) % val_every == 0 or step + 1 == steps or snapshot:
+            run_validation(step + 1)
         if (step + 1) % log_every == 0:
             dt = time.time() - t_log
             pps = n_prompts / max(dt, 1e-6)
@@ -285,14 +306,19 @@ def train(project, pack, log, report, should_stop) -> str:
             t_log = time.time()
             n_prompts = 0
         stopped = should_stop()
-        if (step + 1) % save_every == 0 or stopped or step + 1 == steps:
+        if (step + 1) % save_every == 0 or stopped or snapshot or step + 1 == steps:
             save(step + 1, "last.pt")
+        if snapshot:
+            project.clear_snapshot()   # the waiting snapshot job proceeds from here
+            log(f"snapshot request: validated and saved last.pt at step {step + 1} "
+                f"(val cos {val['val_cos']:.4f}); training continues")
         if stopped:
             log(f"stop requested: saved last.pt at step {step + 1}")
             break
     log_f.close()
     if not (out_dir / "best.pt").exists():
         save(step + 1, "best.pt")
+    project.clear_snapshot()
     report({"step": step + 1, "steps": steps, "best_val_cos": best_val_cos, **val})
     log(f"{'stopped' if stopped else 'done'} at step {step + 1}, best val cos {best_val_cos:.4f}")
     return "stopped" if stopped else "done"

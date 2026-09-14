@@ -461,3 +461,22 @@ input[type="range"] { width: 100%; margin-top: 6px; accent-color: var(--accent);
 .file-row .meta { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
 .browse-list .proj { font-size: 10px; color: var(--accent); margin-left: 6px; }
 @media (max-width: 640px) { .grid4 { grid-template-columns: 1fr 1fr; } #stage-strip { grid-template-columns: repeat(3, 1fr); } }
+
+/* confirm dialog: optional radio / checkbox fields (snapshot export) */
+.confirm-fields:empty { display: none; }
+.confirm-fields { display: flex; flex-direction: column; gap: 6px; margin: 0 0 10px; }
+.confirm-fields .field-group { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; background: var(--input-bg); }
+.confirm-fields .field-group .group-label { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+.confirm-fields label.opt { display: flex; align-items: baseline; gap: 8px; font-size: 12px; line-height: 1.5; cursor: pointer; }
+.confirm-fields label.opt input { margin: 0; position: relative; top: 1px; }
+.confirm-fields label.opt .desc { color: var(--text-muted); font-size: 11px; }
+
+/* snapshots table (Output tab) */
+.snap-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.snap-table th { text-align: left; font-weight: 600; font-size: 11px; color: var(--text-muted); padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.snap-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: baseline; }
+.snap-table tr:last-child td { border-bottom: none; }
+.snap-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.snap-table td.file { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+.snap-table .tag { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-muted); margin-left: 4px; }
+.snap-table .tag.best { border-color: var(--ok); color: var(--ok); }

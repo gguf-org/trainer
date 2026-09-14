@@ -7,6 +7,11 @@ Resume button) picks up exactly where the pipeline stopped.
     pipeline.log      stdout/stderr of the detached pipeline process
     pipeline.pid      pid of the running pipeline (stale after a reboot)
     STOP              request file: the pipeline saves and exits when it appears
+    SNAPSHOT          request file: the train stage validates + saves last.pt
+                      at the current step and removes it (snapshot export)
+    snapshots.json    manifest of the step-tagged GGUFs exported mid-run
+    snapshot.log / .snapshot.pid / .snapshot.status
+                      the detached snapshot-export job (see snapshot.py)
     materials/        downloaded teacher / tokenizer / vision encoder
     data/             train.txt / val.txt corpus
     shards/{val,train}/*.npz   precomputed teacher targets + student states
@@ -18,7 +23,8 @@ Resume button) picks up exactly where the pipeline stopped.
     ../               exported .gguf files land NEXT TO the project folder by
                       default (export.output_dir overrides), e.g.
                       test-trainer/pig_llada_adapter-f16.gguf next to
-                      test-trainer/llada_adapter/
+                      test-trainer/llada_adapter/; mid-run snapshots are
+                      step-tagged: test-trainer/pig_llada_adapter-step2500-f16.gguf
 """
 
 from __future__ import annotations
@@ -163,6 +169,26 @@ class Project:
         return self.path / "STOP"
 
     @property
+    def snapshot_file(self) -> pathlib.Path:
+        return self.path / "SNAPSHOT"
+
+    @property
+    def snapshots_file(self) -> pathlib.Path:
+        return self.path / "snapshots.json"
+
+    @property
+    def snapshot_log_file(self) -> pathlib.Path:
+        return self.path / "snapshot.log"
+
+    @property
+    def snapshot_pid_file(self) -> pathlib.Path:
+        return self.path / ".snapshot.pid"
+
+    @property
+    def snapshot_status_file(self) -> pathlib.Path:
+        return self.path / ".snapshot.status"
+
+    @property
     def materials_dir(self) -> pathlib.Path:
         return self.path / "materials"
 
@@ -255,6 +281,42 @@ class Project:
     def stop_requested(self) -> bool:
         return self.stop_file.exists()
 
+    # -- snapshot request (train stage: validate + save last.pt NOW, keep going) --
+    def request_snapshot(self) -> None:
+        self.snapshot_file.write_text("snapshot\n")
+
+    def clear_snapshot(self) -> None:
+        try:
+            self.snapshot_file.unlink()
+        except OSError:
+            pass
+
+    def snapshot_requested(self) -> bool:
+        return self.snapshot_file.exists()
+
+    def snapshot_path(self, step: int) -> pathlib.Path:
+        """Step-tagged export of a checkpoint taken before training finished:
+        pig_llada_adapter-step2500-f16.gguf (listed by output_files(): it
+        carries the project's export prefix)."""
+        return self.output_dir / f"{self.config['name']}-step{int(step)}-f16.gguf"
+
+    def snapshots(self) -> List[Dict[str, Any]]:
+        """Manifest of the snapshot exports (newest last), each with the step,
+        checkpoint kind, validation cosine at that step and the optional eval."""
+        m = read_json(self.snapshots_file, None)
+        return list(m.get("snapshots", [])) if isinstance(m, dict) else []
+
+    def checkpoint_info(self, name: str) -> Dict[str, Any]:
+        """checkpoints/<name>.json sidecar (step, val_cos, best_val_cos, ...)."""
+        ck = self.checkpoints_dir / name
+        if not ck.is_file():
+            return {}
+        info = read_json(self.checkpoints_dir / name.replace(".pt", ".json"), {}) or {}
+        info = dict(info)
+        info["path"] = str(ck)
+        info["mtime"] = ck.stat().st_mtime
+        return info
+
     # -- stage artifacts (what "done" means for each stage) --
     def corpus_files(self) -> Dict[str, pathlib.Path]:
         c = self.config["corpus"]
@@ -328,12 +390,14 @@ class Project:
             out[key] = {"done": total is not None and done >= total, "done_shards": done, "total_shards": total}
         last = self.checkpoints_dir / "last.pt"
         best = self.checkpoints_dir / "best.pt"
-        ck_step = None
-        if last.is_file():
-            ck_step = read_json(self.checkpoints_dir / "last.json", {}).get("step")
+        last_info = self.checkpoint_info("last.pt")
+        best_info = self.checkpoint_info("best.pt")
+        ck_step = last_info.get("step")
         out["train"] = {"done": ck_step is not None and ck_step >= int(self.config["train"]["steps"]),
                         "has_last": last.is_file(), "has_best": best.is_file(), "step": ck_step,
-                        "steps": int(self.config["train"]["steps"])}
+                        "steps": int(self.config["train"]["steps"]),
+                        "last_val_cos": last_info.get("val_cos"), "best_step": best_info.get("step"),
+                        "best_val_cos": best_info.get("best_val_cos")}
         ap = self.adapter_path()
         exported = ap.is_file() and best.is_file() and ap.stat().st_mtime >= best.stat().st_mtime
         out["export"] = {"done": exported, "path": str(ap)}
@@ -361,6 +425,11 @@ class Project:
                                   "mtime": p.stat().st_mtime})
         return files
 
+    def snapshot_job_status(self) -> Dict[str, Any]:
+        from .snapshot import job_status
+
+        return job_status(self)
+
     def summary(self) -> Dict[str, Any]:
         st = self.read_state()
         return {
@@ -374,6 +443,8 @@ class Project:
             "output_dir": str(self.output_dir),
             "output_files": self.output_files(),
             "eval": read_json(self.eval_path(), None),
+            "snapshots": self.snapshots(),
+            "snapshot_job": self.snapshot_job_status(),
             "stages": STAGES,
             "stage_titles": STAGE_TITLES,
             "python": sys.executable,

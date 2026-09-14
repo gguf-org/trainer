@@ -17,7 +17,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
-from . import __version__, corpus, hardware, materials, runner
+from . import __version__, corpus, hardware, materials, runner, snapshot
 from .packs import get_pack, list_packs
 from .vision_data import image_preset_list
 from .project import STAGES, STAGE_TITLES, Project, default_projects_root, load_settings, save_settings
@@ -115,6 +115,7 @@ def _project_payload(p: Project, online: bool = True) -> Dict[str, Any]:
     d["engine_command"] = pack.engine_command(pathlib.Path(student).name if student else "<pig_clip.gguf>",
                                               str(p.adapter_path()), {k: v for k, v in extras.items()})
     d["sample_bytes"] = pack.sample_bytes(p.config)
+    d["snapshot_blocker"] = snapshot.can_snapshot(p)      # None = the Snapshot button works now
     d["log_size"] = p.log_file.stat().st_size if p.log_file.exists() else 0
     return d
 
@@ -166,14 +167,20 @@ def _reset(p: Project, what: str) -> None:
 
     if p.is_running():
         raise ApiError("stop the pipeline before resetting")
+    if snapshot.job_running(p):
+        raise ApiError("a snapshot export is still running")
+    # the snapshot manifest describes the checkpoints of THIS run: it goes
+    # with the checkpoints (the step-tagged GGUFs themselves stay until
+    # "output" removes them together with the other exports)
+    snap_files = [p.snapshots_file, p.snapshot_status_file, p.snapshot_pid_file]
     targets = {
-        "corpus": [p.data_dir],
-        "shards": [p.shards_dir],
+        "corpus": [p.data_dir, *snap_files],
+        "shards": [p.shards_dir, *snap_files],
         "shards_val": [p.shards_dir / "val"],
-        "train": [p.checkpoints_dir, p.eval_path()],
+        "train": [p.checkpoints_dir, p.eval_path(), *snap_files],
         # the output folder is shared (it holds the project folder itself):
         # remove only this project's exported files, never the directory
-        "output": [pathlib.Path(f["path"]) for f in p.output_files()],
+        "output": [pathlib.Path(f["path"]) for f in p.output_files()] + snap_files,
         "state": [],
     }
     if what not in targets:
@@ -341,6 +348,15 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/pipeline/kill":
                 p = _project(body)
                 self._json({"killed": runner.kill(p)})
+            elif path == "/api/snapshot":
+                # export the adapter at its current step (works while training runs)
+                p = _project(body)
+                ck = body.get("checkpoint") or "last"
+                if ck not in snapshot.CHECKPOINTS:
+                    raise ApiError(f"checkpoint must be one of {snapshot.CHECKPOINTS}")
+                self._json(snapshot.start_job(p, ck, do_eval=bool(body.get("eval")),
+                                              fresh=body.get("fresh", True) is not False,
+                                              device=body.get("device") or None))
             elif path == "/api/project/reset":
                 p = _project(body)
                 _reset(p, body.get("what") or "")

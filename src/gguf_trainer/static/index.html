@@ -253,7 +253,8 @@
         <div class="card-head"><h3>Pipeline</h3><span class="badge" id="train-project-badge">no project</span>
           <span style="flex:1"></span>
           <button class="btn btn-small btn-primary" id="train-start">Start / Resume</button>
-          <button class="btn btn-small btn-danger" id="train-stop" style="display:none">Stop</button>
+          <button class="btn btn-small btn-danger" id="train-stop" style="display:none" title="Saves the checkpoint after the current step and exits; Start / Resume continues from it">Stop</button>
+          <button class="btn btn-small" id="train-snapshot" style="display:none" title="Export the adapter at its current step as a step-tagged GGUF — training keeps running (or stays stopped)">Export snapshot</button>
           <select id="reset-select" class="flag-select" style="max-width:none">
             <option value="">Reset…</option>
             <option value="train">training (checkpoints)</option>
@@ -264,6 +265,8 @@
         </div>
         <div id="stage-strip"></div>
         <p class="hint" id="stage-hint" style="display:none">Once training has produced <code>best.pt</code>, the <b>Export GGUF</b> and <b>Evaluate</b> boxes are clickable: they regenerate the GGUF / <code>eval.json</code> (kept in the project folder) from the checkpoint at any time, e.g. after the file was deleted.</p>
+        <p class="hint" id="snapshot-hint" style="display:none">You do not have to wait for the last step: <b>Stop</b> pauses the run after the current step (Start / Resume continues it), and <b>Export snapshot</b> writes a usable <code>&lt;name&gt;-step&lt;N&gt;-f16.gguf</code> from the current step at any moment — also while training runs. Snapshots are listed on the Output tab with their validation score, so the steps-vs-quality trade-off is visible instead of hidden behind the final export.</p>
+        <p class="hint" id="snapshot-job" style="display:none"></p>
         <div id="stage-detail" style="margin-top:12px">
           <div class="progress-wrap"><div class="progress-bar" id="stage-bar"></div></div>
           <div id="stage-text" class="hint"></div>
@@ -323,6 +326,13 @@
         <p class="hint" id="eval-hint"></p>
       </section>
       <section class="card">
+        <div class="card-head"><h3>Snapshots</h3><span class="summary-note" id="snapshots-note"></span>
+          <span style="flex:1"></span>
+          <button class="btn btn-small" id="output-snapshot" style="display:none" title="Export the adapter at its current step as a step-tagged GGUF">Export snapshot</button></div>
+        <div id="snapshot-table"></div>
+        <p class="hint">Mid-run exports of the same adapter, one per step: try any of them in the engine with the command below (swap the file name) and see how much of the final quality is already there after a fraction of the steps. <code>val cos</code> is the validation cosine measured when the checkpoint was saved; <code>eval</code> is the full evaluation of the exported GGUF when it was requested. Training can continue or resume after every snapshot.</p>
+      </section>
+      <section class="card">
         <div class="card-head"><h3>Use it in ggk</h3><span style="flex:1"></span><button class="btn btn-small" id="copy-cmd">Copy</button></div>
         <div class="cmd" id="cmd-preview"></div>
         <p class="hint" id="output-hint"></p>
@@ -370,6 +380,7 @@
     <div class="modal-body">
       <p class="confirm-text" id="confirm-text"></p>
       <ul class="confirm-list" id="confirm-list"></ul>
+      <div class="confirm-fields" id="confirm-fields"></div>
       <p class="confirm-note" id="confirm-note"></p>
     </div>
     <div class="modal-footer confirm-footer">

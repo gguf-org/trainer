@@ -1,7 +1,6 @@
 """The student: pig_clip as a torch model, loaded straight from its GGUF.
 
-pig_clip (trainer7) is a native train/fine-tune, not a stock Qwen3 checkpoint,
-but its GGUFs carry the plain Qwen3 tensor layout — HF tensor
+pig_clip GGUFs (trainer7) carry the plain Qwen3-0.6B layout — HF tensor
 names under "model.", 1-D/norm f32, 2-D f16 — so a Qwen3Model built from
 the base config can take the weights directly.  Quantized variants are
 dequantized with gguf-connector's vendored gguf-py quant code; the adapter is best trained against the f16 file

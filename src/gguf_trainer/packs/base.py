@@ -11,8 +11,9 @@
     (e.g. the paired vision encoder);
   * its own defaults for the corpus / precompute / training settings.
 
-The student side (pig_clip = a Qwen3-0.6B GGUF + the callgg/pig-clip-tokenizer
-snapshot) is shared by every pack.
+The student side (pig_clip = a native train/fine-tune GGUF in the Qwen3 layout
++ the callgg/pig-clip-tokenizer snapshot it shares the tokenizer with) is
+shared by every pack.
 """
 
 from __future__ import annotations

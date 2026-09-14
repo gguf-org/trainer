@@ -201,8 +201,12 @@ def train(project, pack, log, report, should_stop) -> str:
         if ck.get("torch_rng") is not None:
             torch.set_rng_state(ck["torch_rng"].byte().cpu())
         log(f"resumed from {last} at step {start_step} (best_val_cos {best_val_cos:.4f})")
+        ck_steps = (ck.get("train_config") or {}).get("steps")
+        if ck_steps is not None and int(ck_steps) != steps:
+            log(f"planned steps changed: {int(ck_steps)} -> {steps} (project settings); the lr schedule "
+                f"follows the new count")
         if start_step >= steps:
-            log("training already complete")
+            log(f"training already complete ({start_step} >= {steps} planned steps; raise train.steps to continue)")
             return "done"
 
     stream = ShardStream(str(train_dir), batch_size, seed=int(tc.get("seed", 42)), state=stream_state)
@@ -265,6 +269,33 @@ def train(project, pack, log, report, should_stop) -> str:
         log(f"  val @ {step}: rel_mse {val['val_rel_mse']:.4f} cos {val['val_cos']:.4f}{extra} "
             f"(best {best_val_cos:.4f})")
 
+    def poll_planned_steps(step):
+        """Pick up a changed train.steps from project.json (GUI "Apply" /
+        `gguf-trainer set --steps` / a hand edit) without a restart.  Returns
+        the (possibly new) count; a count at or below the current step ends
+        the run at this step."""
+        nonlocal steps, cfg_mtime
+        try:
+            m = os.stat(project.config_file).st_mtime_ns
+        except OSError:
+            return steps
+        if m == cfg_mtime:
+            return steps
+        cfg_mtime = m
+        new = project.live_train_steps()
+        if new is None or new == steps:
+            return steps
+        log(f"planned steps changed: {steps} -> {new} (project settings edited at step {step}); "
+            + ("finishing now" if new <= step else "the lr schedule follows the new count"))
+        steps = new
+        tc["steps"] = new           # the checkpoint's train_config records the count in force
+        return steps
+
+    try:
+        cfg_mtime = os.stat(project.config_file).st_mtime_ns
+    except OSError:
+        cfg_mtime = None
+
     adapter.train()
     t_log = time.time()
     t_start = time.time()
@@ -272,7 +303,7 @@ def train(project, pack, log, report, should_stop) -> str:
     steps_done_here = 0
     step = start_step
     stopped = False
-    for step in range(start_step, steps):
+    while step < steps:
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
         batch = next(train_iter)
@@ -284,6 +315,10 @@ def train(project, pack, log, report, should_stop) -> str:
         n_prompts += batch["target"].shape[0]
         steps_done_here += 1
 
+        if (step + 1) % log_every == 0:
+            steps = poll_planned_steps(step + 1)
+            if steps <= step + 1:
+                steps = step + 1        # the shortened run ends here: validate + save as the final step
         snapshot = project.snapshot_requested()
         if (step + 1) % val_every == 0 or step + 1 == steps or snapshot:
             run_validation(step + 1)
@@ -315,6 +350,9 @@ def train(project, pack, log, report, should_stop) -> str:
         if stopped:
             log(f"stop requested: saved last.pt at step {step + 1}")
             break
+        step += 1
+    # after the loop `step` is the last step run (0-based), as the for-loop left it
+    step = max(start_step, min(step, steps - 1))
     log_f.close()
     if not (out_dir / "best.pt").exists():
         save(step + 1, "best.pt")

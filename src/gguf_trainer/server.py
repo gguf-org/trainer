@@ -317,6 +317,14 @@ class Handler(BaseHTTPRequestHandler):
                 p = _project(body)
                 p.save_config(body.get("config") or p.config)
                 self._json(_project_payload(p, online=False))
+            elif path == "/api/project/steps":
+                # change the planned training steps; a running train stage
+                # picks the new count up at its next log interval
+                p = _project(body)
+                steps = p.set_train_steps(body.get("steps"))
+                d = _project_payload(p, online=False)
+                d["steps"] = steps
+                self._json(d)
             elif path == "/api/materials/download":
                 p = _project(body)
                 pack = get_pack(p.config["pack"])

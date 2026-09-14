@@ -790,6 +790,56 @@ function renderPipeline() {
   ];
   $('train-metrics').innerHTML = cells.map(([k, v]) => `<div class="cell"><div class="k">${k}</div><div class="v">${escapeHTML(v)}</div></div>`).join('');
   $('metrics-note').textContent = art.train.has_last ? `checkpoints: last${art.train.has_best ? ' + best' : ''}` : 'no checkpoints yet';
+  renderStepsControl();
+}
+
+// ─── Planned steps (Train tab) ───────────────────────────────────────────────
+// The count lives in project.json (train.steps).  The trainer re-reads it at
+// every log interval, so Apply works before, during and after a run.
+
+function renderStepsControl() {
+  const inp = $('train-steps');
+  const saved = Number(project.config.train.steps);
+  if (document.activeElement !== inp) inp.value = saved;
+  const art = project.artifacts.train, st = project.state, running = project.runtime_status === 'running';
+  const tr = st.stages.train || {};
+  const live = running && st.stage === 'train' ? (tr.steps || saved) : null;
+  const ckStep = art.step;
+  let note = '';
+  if (live != null && live !== saved) note = `saved ${saved}, trainer still on ${live} — picked up at the next log interval`;
+  else if (!running && ckStep != null && ckStep >= saved) note = `checkpoint at step ${ckStep} — raise the count and press Start / Resume to train further`;
+  else if (!running && ckStep != null) note = `checkpoint at step ${ckStep} of ${saved}`;
+  $('train-steps-note').textContent = note;
+  $('train-steps-apply').disabled = Number(inp.value) === saved;
+}
+$('train-steps').addEventListener('input', () => { $('train-steps-apply').disabled = Number($('train-steps').value) === Number(project.config.train.steps); });
+$('train-steps').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); applySteps(); } });
+$('train-steps-apply').onclick = () => applySteps();
+
+async function applySteps() {
+  if (!project) return;
+  const v = Number($('train-steps').value);
+  if (!Number.isInteger(v) || v < 1) { showError('Steps must be a positive whole number.'); return; }
+  const before = Number(project.config.train.steps);
+  if (v === before) return;
+  clearError();
+  try {
+    const data = await api('/api/project/steps', { path: project.path, steps: v });
+    if (config) config.train.steps = data.steps;      // keep the Setup form in sync without marking it dirty
+    applyProject(data);
+    const art = project.artifacts.train, running = project.runtime_status === 'running';
+    const ckStep = art.step;
+    if (running && project.state.stage === 'train') {
+      showNotice(v > before ? `Planned steps ${before} → ${v}: the trainer continues to ${v} (picked up within a log interval).`
+        : `Planned steps ${before} → ${v}: the trainer finishes at its next log interval (validate + save), then exports.`);
+    } else if (!running && ckStep != null && ckStep < v && (ckStep >= before || project.state.status === 'done')) {
+      showNotice(`Planned steps ${before} → ${v}. Press Start / Resume to continue training from step ${ckStep}.`);
+    } else if (!running && ckStep != null && ckStep >= v) {
+      showNotice(`Planned steps ${before} → ${v}: the checkpoint at step ${ckStep} already covers it — the training stage counts as done; export runs from best.pt.`);
+    } else {
+      showNotice(`Planned steps ${before} → ${v} saved.`);
+    }
+  } catch (e) { showError(e.message); }
 }
 
 // ─── Metrics chart ───────────────────────────────────────────────────────────

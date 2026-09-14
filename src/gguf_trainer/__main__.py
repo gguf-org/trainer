@@ -48,9 +48,25 @@ def _cmd_serve(args) -> int:
     return 0
 
 
+def _apply_steps(project, steps) -> None:
+    """--steps N: write train.steps into project.json before launching (a
+    pipeline already running picks it up too, see `set`)."""
+    if steps is None:
+        return
+    before = project.config["train"]["steps"]
+    after = project.set_train_steps(steps)
+    print(f"train.steps: {before} -> {after}" if before != after else f"train.steps: {after} (unchanged)")
+
+
 def _cmd_run(args) -> int:
     from .pipeline import main
+    from .project import Project
 
+    p = Project(args.project)
+    if not p.exists():
+        print(f"no project at {p.path}")
+        return 2
+    _apply_steps(p, args.steps)
     return main(["--project", args.project] + (["--only", *args.only] if args.only else [])
                 + (["--force"] if args.force else []))
 
@@ -63,6 +79,7 @@ def _cmd_start(args) -> int:
     if not p.exists():
         print(f"no project at {p.path}")
         return 2
+    _apply_steps(p, args.steps)
     pid = start(p, args.only or None, force=args.force)
     print(f"pipeline launched (pid {pid}), logging to {p.log_file}")
     return 0
@@ -93,6 +110,30 @@ def _cmd_snapshot(args) -> int:
     return main(["--project", str(p.path), "--checkpoint", args.checkpoint]
                 + (["--eval"] if args.eval else []) + (["--no-fresh"] if args.no_fresh else [])
                 + (["--device", args.device] if args.device else []) + ["--timeout", str(args.timeout)])
+
+
+def _cmd_set(args) -> int:
+    """Change settings of an existing project (currently: the planned steps).
+    Works while the pipeline runs: the train stage re-reads project.json at
+    its next log interval and finishes / continues at the new count."""
+    from .project import Project
+
+    p = Project(args.project)
+    if not p.exists():
+        print(f"no project at {p.path}")
+        return 2
+    if args.steps is None:
+        print(f"train.steps: {p.config['train']['steps']}")
+        return 0
+    _apply_steps(p, args.steps)
+    art = p.stage_artifacts()["train"]
+    if p.is_running():
+        print("pipeline running: the trainer picks the new count up within a log interval")
+    elif art["step"] is not None and art["step"] >= art["steps"]:
+        print(f"checkpoint at step {art['step']} already covers it: the training stage counts as done")
+    elif art["step"] is not None:
+        print(f"checkpoint at step {art['step']}: `gguf-trainer start --project {p.path}` continues to {art['steps']}")
+    return 0
 
 
 def _cmd_status(args) -> int:
@@ -161,7 +202,13 @@ def main(argv=None) -> int:
         sp.add_argument("--only", nargs="*", default=None, help="restrict to these stages")
         sp.add_argument("--force", action="store_true",
                         help="re-run export/eval even if the GGUF / eval.json are up to date (e.g. after deleting the GGUF)")
+        sp.add_argument("--steps", default=None,
+                        help="set the planned training steps (train.steps, default 20000; '12k' works) before launching")
         sp.set_defaults(func=fn)
+    p_set = sub.add_parser("set", help="change a project's planned training steps (also while it runs)")
+    p_set.add_argument("--project", required=True)
+    p_set.add_argument("--steps", default=None, help="new train.steps (omit to print the current value)")
+    p_set.set_defaults(func=_cmd_set)
     p_stop = sub.add_parser("stop", help="stop a running pipeline (it saves first)")
     p_stop.add_argument("--project", required=True)
     p_stop.add_argument("--timeout", type=float, default=30.0)
@@ -188,7 +235,7 @@ def main(argv=None) -> int:
     p_dl.set_defaults(func=_cmd_download)
 
     argv_list = list(sys.argv[1:] if argv is None else argv)
-    if not argv_list or argv_list[0] not in ("serve", "run", "start", "stop", "status", "download", "snapshot", "-h", "--help", "--version"):
+    if not argv_list or argv_list[0] not in sub.choices and argv_list[0] not in ("-h", "--help", "--version"):
         argv_list.insert(0, "serve")
     args = parser.parse_args(argv_list)
     return args.func(args)

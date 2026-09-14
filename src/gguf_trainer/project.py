@@ -116,6 +116,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+def validate_steps(v: Any) -> int:
+    """train.steps as a positive int (accepts "12000", 12000.0, "12k")."""
+    if isinstance(v, str):
+        t = v.strip().lower().replace(",", "").replace("_", "")
+        if t.endswith("k"):
+            t = str(float(t[:-1]) * 1000)
+        v = t
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"train.steps must be a positive whole number, got {v!r}")
+    if f != f or f < 1 or f != int(f):
+        raise ValueError(f"train.steps must be a positive whole number, got {v!r}")
+    return int(f)
+
+
 def _merge(base: Dict[str, Any], upd: Dict[str, Any]) -> Dict[str, Any]:
     out = copy.deepcopy(base)
     for k, v in (upd or {}).items():
@@ -234,8 +250,29 @@ class Project:
     def save_config(self, cfg: Optional[Dict[str, Any]] = None) -> None:
         if cfg is not None:
             self.config = _merge(DEFAULT_CONFIG, cfg)
+        self.config["train"]["steps"] = validate_steps(self.config["train"].get("steps"))
         self.path.mkdir(parents=True, exist_ok=True)
         write_json_atomic(self.config_file, self.config)
+
+    def set_train_steps(self, steps: Any) -> int:
+        """Change the planned step count (project.json) — before, between or
+        during runs: a training loop in progress re-reads it (see
+        train.py) and finishes at the new count."""
+        self.config["train"]["steps"] = validate_steps(steps)
+        self.save_config()
+        return self.config["train"]["steps"]
+
+    def live_train_steps(self) -> Optional[int]:
+        """The planned steps as project.json says RIGHT NOW (None when the
+        file is unreadable or mid-write), for the running trainer to pick up
+        a change made from the GUI / CLI without a restart."""
+        cfg = read_json(self.config_file, None)
+        if not isinstance(cfg, dict):
+            return None
+        try:
+            return validate_steps((cfg.get("train") or {}).get("steps"))
+        except ValueError:
+            return None
 
     # -- state --
     def read_state(self) -> Dict[str, Any]:

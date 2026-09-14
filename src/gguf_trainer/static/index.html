@@ -193,7 +193,7 @@
           <div class="grid4">
             <label class="field-label">Width<input type="number" data-cfg="train.width" min="64" step="64"></label>
             <label class="field-label">Depth<input type="number" data-cfg="train.depth" min="1"></label>
-            <label class="field-label">Steps<input type="number" data-cfg="train.steps" min="1" step="500"></label>
+            <label class="field-label">Steps<input type="number" data-cfg="train.steps" min="1" step="500" title="Planned optimizer steps (default 20000). Change it any time — also while training runs (the trainer picks it up within a log interval) or after a finished run (Start / Resume continues from last.pt to the new count)."></label>
             <label class="field-label">Batch size<input type="number" data-cfg="train.batch_size" min="1"></label>
           </div>
           <div class="grid4">
@@ -215,6 +215,7 @@
             <label class="field-label">Seed<input type="number" data-cfg="train.seed"></label>
           </div>
           <p class="hint" id="train-hint"></p>
+          <p class="hint"><b>Steps</b> is not locked in: change it here (Save settings) or on the Train tab at any point. While training runs the new count takes effect within a log interval — lower it to finish (validate, save, export) at the current step, raise it to keep going; after a finished run a higher count resumes from <code>last.pt</code>. The cosine lr schedule is computed from the count in force, so extending a finished run lifts the lr back up mid-schedule.</p>
         </div>
         </details>
       </section>
@@ -262,6 +263,12 @@
             <option value="corpus">corpus + everything after</option>
             <option value="state">status only (keep files)</option>
           </select>
+        </div>
+        <div class="field-row" id="train-steps-row" style="margin-top:0;margin-bottom:10px">
+          <span class="flag-label">planned steps</span>
+          <input type="number" id="train-steps" min="1" step="500" style="width:110px" title="Total optimizer steps for this project (default 20000)">
+          <button class="btn btn-small" id="train-steps-apply">Apply</button>
+          <span class="hint-inline" id="train-steps-note"></span>
         </div>
         <div id="stage-strip"></div>
         <p class="hint" id="stage-hint" style="display:none">Once training has produced <code>best.pt</code>, the <b>Export GGUF</b> and <b>Evaluate</b> boxes are clickable: they regenerate the GGUF / <code>eval.json</code> (kept in the project folder) from the checkpoint at any time, e.g. after the file was deleted.</p>

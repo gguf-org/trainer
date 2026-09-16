@@ -365,3 +365,8 @@ prompt template / `build_teacher()` / `build_mock_teacher()`, and the
 export key/values, then register it in `gguf_trainer/packs/__init__.py`.
 `packs/llada_image.py` and `packs/qwen3vl_mageflow.py` are the two
 references.
+
+![screenshot](https://raw.githubusercontent.com/gguf-org/gguf-desktop/master/pizza.jpg)
+
+## Reference
+[pig engine - the new gguf compute kernels (gk)](https://github.com/gguf-io/gk)

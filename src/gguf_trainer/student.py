@@ -71,11 +71,22 @@ def load_student(gguf_path: pathlib.Path, hf_dir: pathlib.Path, device, dtype=No
     return model, tok
 
 
+QWEN_PAD_ID = 151643      # <|endoftext|>: what ggk feeds the LLM for an empty prompt
+
+
 def tokenize_student(prompts: List[str], tok, format_prompt, max_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    """-> ids [S, L] int32 right-padded, len [S] int32."""
+    """-> ids [S, L] int32 right-padded, len [S] int32 (>= 1: a prompt that
+    formats to the empty string becomes the single pad token, as in the engine)."""
     enc = tok([format_prompt(p) for p in prompts], padding=True, truncation=True, max_length=max_len,
               add_special_tokens=False, return_tensors="np")
     ids = enc["input_ids"].astype(np.int32)
     lens = enc["attention_mask"].sum(axis=1).astype(np.int32)
+    if ids.shape[1] == 0:
+        ids = np.zeros((len(prompts), 1), dtype=np.int32)
+    empty = lens == 0
+    if empty.any():
+        pad = tok.pad_token_id if tok.pad_token_id is not None else QWEN_PAD_ID
+        ids[empty, 0] = pad
+        lens[empty] = 1
     assert (lens > 0).all()
     return ids, lens

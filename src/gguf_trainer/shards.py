@@ -3,6 +3,9 @@ checkpointable infinite training stream (trainer4/trainer8 design: the
 stream position is part of the checkpoint, so a resume replays exactly).
 
   resampler:      t_pack [S*NQ, out_dim] fixed rows per sample, num_queries > 0
+  seeded:         num_queries > 0 AND seed_ids [S, NQ] (the teacher tokenizer's
+                  window) + seed_len [S]; t_pack [sum(seed_len), out_dim] holds
+                  only the real slots, packed in sample order
   token-aligned:  t_pack [T, out_dim] one row per real token, packed like
                   q_pack; v_pack [Tv, vis_dim] raw vision embeds + a
                   (vis_sample, vis_start, vis_len) segment table; n_images
@@ -57,6 +60,11 @@ class Shard:
         self.off = np.concatenate([[0], np.cumsum(self.len)])
         self.n = len(self.len)
         self.token_aligned = self.num_queries == 0
+        self.seeded = "seed_ids" in z
+        if self.seeded:
+            self.seed_ids = z["seed_ids"].astype(np.int64)
+            self.seed_len = z["seed_len"].astype(np.int64)
+            self.seed_off = np.concatenate([[0], np.cumsum(self.seed_len)])
         if self.token_aligned:
             self.n_images = z["n_images"] if "n_images" in z else np.zeros(self.n, dtype=np.int32)
             self.v_pack = z["v_pack"] if "v_pack" in z else np.empty((0, 0), dtype=np.int16)
@@ -73,6 +81,25 @@ class Shard:
         L = int(self.len[rows].max())
         hidden = np.zeros((B, L, self.q_pack.shape[1]), dtype=np.int16)
         keep = np.zeros((B, L), dtype=bool)
+        if self.seeded:
+            NQ = self.num_queries
+            target = np.zeros((B, NQ, self.t_pack.shape[1]), dtype=np.int16)
+            seed_mask = np.zeros((B, NQ), dtype=bool)
+            for j, r in enumerate(rows):
+                n = int(self.seed_len[r])
+                target[j, :n] = self.t_pack[self.seed_off[r]: self.seed_off[r + 1]]
+                seed_mask[j, :n] = True
+                li = int(self.len[r])
+                hidden[j, :li] = self.q_pack[self.off[r]: self.off[r + 1]]
+                keep[j, :li] = True
+            return {
+                "prompts": [str(self.prompts[r]) for r in rows],
+                "target": from_bits(target),
+                "qwen_hidden": from_bits(hidden),
+                "keep": torch.from_numpy(keep),
+                "seed_ids": torch.from_numpy(self.seed_ids[rows]),
+                "seed_mask": torch.from_numpy(seed_mask),
+            }
         if not self.token_aligned:
             NQ = self.num_queries
             target = np.empty((B, NQ, self.t_pack.shape[1]), dtype=np.int16)

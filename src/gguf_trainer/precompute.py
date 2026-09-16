@@ -8,6 +8,9 @@ contract are discarded (with the checkpoints trained on them) and rebuilt.
   resampler packs (text corpus, one line per prompt):
     prompts [S]     t_pack [S*NQ, out_dim]   q_pack [T, in_dim]
     len [S]         ids [T]                  stat_s/stat_s2/stat_n (target moments)
+  seeded resampler packs (text corpus; the teacher tokenizer's window per prompt):
+    prompts [S]  seed_ids [S, NQ]  seed_len [S]  t_pack [sum(seed_len), out_dim] real slots only
+    q_pack [T, in_dim]  len [S]  ids [T]  stat_s/stat_s2/stat_n over the real slots
   token-aligned vision packs ((image, instruction) jsonl corpus):
     prompts [S]  n_images [S]  t_pack [T, out_dim]  q_pack [T, in_dim]
     v_pack [Tv, vis_dim] + vis_sample/vis_start/vis_len segment table
@@ -97,6 +100,15 @@ def auto_budgets(pc: dict, dev: torch.device) -> dict:
     return {k: (int(pc.get(k) or 0) or v) for k, v in defaults.items()}
 
 
+def auto_budgets_seeded(pc: dict, dev: torch.device) -> dict:
+    """0 = pick for the card (the T5 teacher is one dense encoder; the token
+    budget counts real teacher tokens per batch)."""
+    big = dev.type == "cuda" and torch.cuda.get_device_properties(device_index(dev)).total_memory > 24e9
+    defaults = {"teacher_batch": (256 if big else 64), "tok_budget": (24576 if big else 8192),
+                "student_batch": (256 if big else 64)}
+    return {k: (int(pc.get(k) or 0) or v) for k, v in defaults.items()}
+
+
 def ensure_vision_proj(project, pack, teacher, student_table: torch.Tensor, log) -> torch.Tensor:
     """The frozen vision_proj [in_dim, vis_dim] of a vision pack: fitted once
     per project from the teacher's and the student's embedding tables and
@@ -166,6 +178,9 @@ class PrecomputeContext:
         self.pack = pack
         self.project = project
         self.log = log
+        if self.kind == "seeded_resampler":
+            self.budgets = auto_budgets_seeded(pc, self.dev)
+            log(f"precompute budgets: {self.budgets}")
         if self.kind == "token_aligned_vision":
             from .vision_data import assert_template_counts
 
@@ -197,6 +212,8 @@ class PrecomputeContext:
         """-> True when every shard of the split exists, False when stopped."""
         if self.kind == "token_aligned_vision":
             return self._run_split_token_aligned(split, report, should_stop)
+        if self.kind == "seeded_resampler":
+            return self._run_split_seeded(split, report, should_stop)
         return self._run_split_resampler(split, report, should_stop)
 
     # ------------------------------------------------------------ resampler
@@ -294,6 +311,113 @@ class PrecomputeContext:
             eta = left * size / rate if rate > 0 else None
             log(f"precompute[{split}] shard {si:05d}: {S} prompts in {dt:.0f}s (teacher {t_teacher:.0f}s, "
                 f"{S / dt:.2f} p/s), {left} shards left (~{(eta or 0) / 3600:.1f} h)")
+            report({"done_shards": n_shards - left, "total_shards": n_shards, "shard_progress": 0.0,
+                    "prompts_per_s": rate, "eta_s": eta, "prompts": len(prompts)})
+        log(f"precompute[{split}] done")
+        return True
+
+    # ------------------------------------------------------------ seeded resampler
+    def _run_split_seeded(self, split: str, report, should_stop) -> bool:
+        """Teacher window per prompt (ids + real length) and the teacher rows at
+        the real slots; student states as in the resampler split."""
+        project, pack, log = self.project, self.pack, self.log
+        discard_stale_shards(project, split, log)
+        prompts, size, out_dir, n_shards, todo = shard_plan(project, split)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_shard_contract(project, split)
+        log(f"precompute[{split}]: {len(prompts)} prompts, {n_shards} shards, {len(todo)} to do -> {out_dir}")
+        report({"done_shards": n_shards - len(todo), "total_shards": n_shards, "prompts": len(prompts)})
+        if not todo:
+            return True
+        NQ, T_DIM, S_DIM = pack.num_queries, pack.out_dim, pack.in_dim
+        bud = self.budgets
+        dev = self.dev
+        rate_hist: List[float] = []
+
+        for k, si in enumerate(todo):
+            if should_stop():
+                log(f"precompute[{split}]: stop requested before shard {si:05d}")
+                return False
+            t0 = time.time()
+            chunk = prompts[si * size: (si + 1) * size]
+            seed_ids, seed_len = self.teacher.tokenize(chunk)
+            order = np.argsort(seed_len, kind="stable")          # teacher-length-sorted storage
+            chunk = [chunk[i] for i in order]
+            seed_ids, seed_len = seed_ids[order], seed_len[order]
+            S = len(chunk)
+            assert seed_ids.shape == (S, NQ), seed_ids.shape
+            ids_s, lens_s = tokenize_student(chunk, self.tok, pack.format_prompt, pack.max_len_student)
+            off = np.zeros(S + 1, dtype=np.int64)
+            np.cumsum(lens_s, out=off[1:])
+            T = int(off[-1])
+            seed_off = np.zeros(S + 1, dtype=np.int64)
+            np.cumsum(seed_len, out=seed_off[1:])
+            TT = int(seed_off[-1])
+            t_pack = np.empty((TT, T_DIM), dtype=np.int16)
+            q_pack = np.empty((T, S_DIM), dtype=np.int16)
+            ids_pack = np.empty(T, dtype=np.int32)
+            s = np.zeros(T_DIM, dtype=np.float64)
+            s2 = np.zeros(T_DIM, dtype=np.float64)
+
+            # ---- teacher (token budget counts the real teacher tokens) ----
+            tt = time.time()
+            b0 = 0
+            while b0 < S:
+                if should_stop():
+                    log(f"precompute[{split}]: stop requested inside shard {si:05d} (shard discarded)")
+                    return False
+                b1 = b0 + 1
+                while b1 < S and b1 - b0 < bud["teacher_batch"]:
+                    if (b1 - b0 + 1) * int(seed_len[b1]) > bud["tok_budget"]:
+                        break
+                    b1 += 1
+                rows = self.teacher(seed_ids[b0:b1], seed_len[b0:b1])          # [b, L, T_DIM] bf16 cpu
+                for j in range(b0, b1):
+                    n = int(seed_len[j])
+                    t_pack[seed_off[j]: seed_off[j + 1]] = bf16_bits(rows[j - b0, :n])
+                    v = rows[j - b0, :n].double().numpy()
+                    s += v.sum(0)
+                    s2 += (v * v).sum(0)
+                b0 = b1
+                report({"done_shards": n_shards - len(todo) + k, "total_shards": n_shards,
+                        "shard_progress": b0 / S, "prompts": len(prompts)})
+            t_teacher = time.time() - tt
+
+            # ---- student ----
+            with torch.no_grad():
+                for b0 in range(0, S, bud["student_batch"]):
+                    rows_i = np.arange(b0, min(b0 + bud["student_batch"], S))
+                    Lq = int(lens_s[rows_i].max())
+                    ids = torch.from_numpy(ids_s[rows_i][:, :Lq].astype(np.int64)).to(dev)
+                    mask = (torch.arange(Lq, device=dev)[None, :]
+                            < torch.from_numpy(lens_s[rows_i]).to(dev)[:, None]).long()
+                    h = self.student(input_ids=ids, attention_mask=mask).last_hidden_state.to(torch.bfloat16).cpu()
+                    for j, r in enumerate(rows_i):
+                        li = int(lens_s[r])
+                        q_pack[off[r]: off[r + 1]] = bf16_bits(h[j, :li])
+                        ids_pack[off[r]: off[r + 1]] = ids_s[r, :li]
+
+            path = out_dir / f"{split}-{si:05d}.npz"
+            tmp = out_dir / f"{split}-{si:05d}.tmp.npz"
+            np.savez(tmp, prompts=np.array(chunk), t_pack=t_pack, q_pack=q_pack,
+                     len=lens_s.astype(np.int32), ids=ids_pack,
+                     seed_ids=seed_ids.astype(np.int32), seed_len=seed_len.astype(np.int32),
+                     stat_s=s, stat_s2=s2, stat_n=np.array([TT]), num_queries=np.array([NQ]),
+                     meta=np.array([json.dumps({"pack": pack.id, "student": self.student_name,
+                                                "contract": project.shard_contract(),
+                                                "mock_teacher": self.mock,
+                                                "teacher_mode": getattr(self.teacher, "mode", "?"),
+                                                "storage": "bf16_bits", "shard": si, "time": time.time()})]))
+            with open(tmp, "rb+") as f:
+                os.fsync(f.fileno())
+            replace_atomic(tmp, path)
+            dt = time.time() - t0
+            rate_hist.append(S / dt)
+            rate = sum(rate_hist[-5:]) / len(rate_hist[-5:])
+            left = len(todo) - k - 1
+            eta = left * size / rate if rate > 0 else None
+            log(f"precompute[{split}] shard {si:05d}: {S} prompts in {dt:.0f}s (teacher {t_teacher:.0f}s, "
+                f"{S / dt:.2f} p/s, {TT / S:.1f} teacher slots/prompt), {left} shards left (~{(eta or 0) / 3600:.1f} h)")
             report({"done_shards": n_shards - left, "total_shards": n_shards, "shard_progress": 0.0,
                     "prompts_per_s": rate, "eta_s": eta, "prompts": len(prompts)})
         log(f"precompute[{split}] done")

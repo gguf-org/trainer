@@ -22,7 +22,7 @@ import dataclasses
 import pathlib
 from typing import Any, Dict, List, Optional
 
-ADAPTER_KINDS = ("resampler", "token_aligned_vision")
+ADAPTER_KINDS = ("resampler", "seeded_resampler", "token_aligned_vision")
 
 
 @dataclasses.dataclass
@@ -65,12 +65,19 @@ class TrainerPack:
     id = "base"
     title = "base"
     description = ""
-    adapter_kind = "resampler"     # resampler (query rows) | token_aligned_vision (position i -> i, mmproj ext)
+    adapter_kind = "resampler"     # resampler (query rows) | seeded_resampler (query rows seeded with the
+    #                                teacher tokenizer's ids, pads unsupervised) | token_aligned_vision
+    #                                (position i -> i, mmproj ext)
     in_dim = 1024                  # pig_clip hidden size
     out_dim = 0
     vis_dim = 0                    # token_aligned_vision: raw mmproj embed dim
-    num_queries = 0                # resampler only
+    num_queries = 0                # resampler kinds: query rows (= the teacher window for seeded)
+    seed_vocab = 0                 # seeded_resampler: teacher tokenizer vocab (t5_embed rows)
     needs_images = False           # corpus = (image(s), instruction) samples
+    # GUI: which precompute placement control applies to the teacher
+    #   "placement"    accelerate device_map over GPUs + CPU RAM (LLaDA)
+    #   "teacher_mode" resident | streamed through the GPU (single dense model)
+    teacher_control = "placement"
     default_name = "adapter"       # project / GGUF name suggestion (pig_ prefix added)
     max_len_student = 512
     # Bumped whenever the teacher targets change meaning; shards written
@@ -89,7 +96,9 @@ class TrainerPack:
         return {"id": self.id, "title": self.title, "description": self.description,
                 "adapter_kind": self.adapter_kind, "needs_images": self.needs_images,
                 "in_dim": self.in_dim, "out_dim": self.out_dim, "vis_dim": self.vis_dim,
-                "num_queries": self.num_queries, "default_name": self.default_name,
+                "num_queries": self.num_queries, "seed_vocab": self.seed_vocab,
+                "teacher_control": self.teacher_control, "default_name": self.default_name,
+                "sample_bytes": self.sample_bytes(project.config if project is not None else self.defaults()),
                 "hints": dict(self.hints), "eval_keys": list(self.eval_keys),
                 "materials": [m.to_dict() for m in self.materials(project)],
                 "engine_command": self.engine_command("<pig_clip.gguf>", "<adapter.gguf>")}
@@ -117,6 +126,8 @@ class TrainerPack:
 
     def build_teacher(self, project, device, gpu_mem: str, cpu_mem: str, log):
         """resampler: callable(list[str]) -> [B, num_queries, out_dim] (cpu, bf16), with .text_len(str)
+        seeded_resampler: .tokenize(list[str]) -> (ids [B, num_queries], len [B]) and
+                          callable(ids, len) -> [B, max(len), out_dim] (cpu, bf16) (see t5_teacher.py)
         token_aligned_vision: an object with .encode_images() / .hidden() (see qwen3vl_teacher.py)"""
         raise NotImplementedError
 

@@ -17,6 +17,19 @@ ABSENCE of `query`; the vision extension by the presence of `vision_proj.weight`
     x   = TokenBlock(x) * depth             # pre-LN self-attn (bidirectional) + exact-GELU MLP
     out = out_proj(ln_out(x)) + skip(h)     # width -> out_dim, plus a direct linear path
 
+SEEDED RESAMPLER (trainer / PixArt T5-XXL), selected by the presence of
+BOTH `query` and `t5_embed.weight`:
+
+    kv  = in_proj(h)
+    q   = query + t5_embed[seed_ids]        # query i seeded with the teacher tokenizer's id at slot i
+    q   = Block(q, kv) * depth
+    out = out_proj(ln_out(q))               # one row per teacher slot (pads never supervised)
+
+The seed is what lets a fixed query window follow the teacher's own
+segmentation (T5 sentencepiece over Qwen BPE states); the engine keeps the
+teacher tokenizer at inference and hands the adapter the same EOS + pad-0
+window it builds for the mask, so the ids are free.
+
 v is the RAW mmproj embed at vision positions, so vision fidelity does not
 depend on what survives the 0.6B student.  vis_in is bias-free (zero input
 -> zero contribution) and out_proj is zero-initialized (training starts
@@ -33,6 +46,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 KIND_RESAMPLER = "resampler"
+KIND_SEEDED = "seeded_resampler"
 KIND_TOKEN_VISION = "token_aligned_vision"
 
 
@@ -46,6 +60,7 @@ class AdapterConfig:
     mlp_ratio: float = 4.0
     kind: str = KIND_RESAMPLER
     vis_dim: int = 0                # token_aligned_vision only
+    seed_vocab: int = 0             # seeded_resampler only: teacher tokenizer vocab (t5_embed rows)
 
     @property
     def heads(self):
@@ -61,6 +76,7 @@ class AdapterConfig:
         d.pop("heads", None)
         d.setdefault("kind", KIND_RESAMPLER)
         d.setdefault("vis_dim", 0)
+        d.setdefault("seed_vocab", 0)
         return cls(**d)
 
 
@@ -124,22 +140,33 @@ class TokenBlock(nn.Module):
 
 
 class ResamplerAdapter(nn.Module):
-    kind = KIND_RESAMPLER
+    """Resampler (kind resampler), or the seeded resampler (kind
+    seeded_resampler) when cfg.seed_vocab > 0: the state-dict name of the
+    seed table is `t5_embed` for every teacher, that is the engine's contract."""
 
     def __init__(self, cfg: AdapterConfig):
         super().__init__()
         self.cfg = cfg
+        self.kind = KIND_SEEDED if cfg.seed_vocab > 0 else KIND_RESAMPLER
         self.grad_checkpoint = False
         self.query = nn.Parameter(torch.randn(cfg.num_queries, cfg.width) * 0.02)
+        if cfg.seed_vocab > 0:
+            self.t5_embed = nn.Embedding(cfg.seed_vocab, cfg.width)
+            nn.init.normal_(self.t5_embed.weight, std=0.02)
         self.in_proj = nn.Linear(cfg.in_dim, cfg.width)
         self.blocks = nn.ModuleList(Block(cfg.width, cfg.heads, cfg.mlp_ratio) for _ in range(cfg.depth))
         self.ln_out = nn.LayerNorm(cfg.width)
         self.out_proj = nn.Linear(cfg.width, cfg.out_dim)
 
-    def forward(self, qwen_hidden, keep_mask=None, vis=None):
+    def forward(self, qwen_hidden, keep_mask=None, vis=None, seed_ids=None):
+        # seed_ids [B, num_queries] int64: the teacher tokenizer's ids per slot
+        # (seeded_resampler only; the plain resampler ignores them)
         B = qwen_hidden.shape[0]
         kv = self.in_proj(qwen_hidden)
         q = self.query.unsqueeze(0).expand(B, -1, -1)
+        if self.cfg.seed_vocab > 0:
+            assert seed_ids is not None, "seeded_resampler needs seed_ids"
+            q = q + self.t5_embed(seed_ids)
         for blk in self.blocks:
             if self.grad_checkpoint and self.training:
                 q = torch.utils.checkpoint.checkpoint(blk, q, kv, keep_mask, use_reentrant=False)
@@ -204,11 +231,16 @@ class TokenAlignedVisionAdapter(nn.Module):
 def build_adapter(cfg: AdapterConfig) -> nn.Module:
     if cfg.kind == KIND_TOKEN_VISION:
         return TokenAlignedVisionAdapter(cfg)
+    if cfg.kind == KIND_SEEDED:
+        assert cfg.seed_vocab > 0, "seeded_resampler needs seed_vocab"
+        return ResamplerAdapter(cfg)
     if cfg.kind == KIND_RESAMPLER:
+        assert cfg.seed_vocab == 0, "a plain resampler carries no seed table"
         return ResamplerAdapter(cfg)
     raise ValueError(f"unknown adapter kind {cfg.kind}")
 
 
 def adapter_config_for(pack, width: int, depth: int) -> AdapterConfig:
     return AdapterConfig(in_dim=pack.in_dim, out_dim=pack.out_dim, num_queries=pack.num_queries,
-                         width=width, depth=depth, kind=pack.adapter_kind, vis_dim=pack.vis_dim)
+                         width=width, depth=depth, kind=pack.adapter_kind, vis_dim=pack.vis_dim,
+                         seed_vocab=int(getattr(pack, "seed_vocab", 0) or 0))

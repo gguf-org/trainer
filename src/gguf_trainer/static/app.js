@@ -262,7 +262,7 @@ function renderConfig() {
 }
 
 function packInfo() {
-  return (project && project.pack) ? project.pack : { num_queries: 256, out_dim: 2560, in_dim: 1024, needs_images: false, hints: {}, eval_keys: [] };
+  return (project && project.pack) ? project.pack : { num_queries: 256, out_dim: 2560, in_dim: 1024, needs_images: false, hints: {}, eval_keys: [], teacher_control: 'placement' };
 }
 
 function renderDerived() {
@@ -277,7 +277,10 @@ function renderDerived() {
   $('corpus-images-box').style.display = images ? '' : 'none';
   document.querySelectorAll('.corpus-text-only').forEach(el => { el.style.display = images ? 'none' : ''; });
   document.querySelectorAll('.precompute-vision').forEach(el => { el.style.display = images ? '' : 'none'; });
-  $('precompute-placement-field').style.display = images ? 'none' : '';
+  // which teacher placement control the pack's teacher understands
+  const control = pk.teacher_control || (images ? 'teacher_mode' : 'placement');
+  $('precompute-placement-field').style.display = control === 'placement' ? '' : 'none';
+  $('precompute-teacher-mode-field').style.display = control === 'teacher_mode' ? '' : 'none';
   $('export-sigvq-row').style.display = pk.id === 'llada_image' ? '' : 'none';
   $('corpus-badge').textContent = images ? 'images + instructions' : 'text prompts';
   $('train-summary').textContent = `width ${config.train.width} · depth ${config.train.depth} · ${config.train.steps} steps · batch ${config.train.batch_size}`;
@@ -289,7 +292,8 @@ function renderDerived() {
     perSample = project && project.sample_bytes ? project.sample_bytes : 2.4e6;
   } else {
     nSamples = config.corpus.mode === 'files' ? null : (Number(config.corpus.n_train) + Number(config.corpus.n_val));
-    perSample = pk.num_queries * pk.out_dim * 2 + 60 * pk.in_dim * 2;   // bf16 target rows + ~60 student tokens
+    perSample = (project && project.sample_bytes) ? project.sample_bytes
+      : pk.num_queries * pk.out_dim * 2 + 60 * pk.in_dim * 2;   // bf16 target rows + ~60 student tokens
   }
   $('shard-estimate').textContent = nSamples ? `Shards on disk: ≈ ${humanSize(nSamples * perSample)} for ${nSamples} samples (${humanSize(perSample)} each on average), under <project>/shards.` : '';
   $('output-name-preview').textContent = `→ ${config.name}-f16.gguf`;

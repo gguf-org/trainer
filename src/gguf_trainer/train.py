@@ -12,6 +12,11 @@ MSE whitened by 1/sigma per dim + cos_weight * (1 - cosine) on the RAW
 target (final-norm rows are tame), out_proj zero-initialized, vision_proj
 frozen; the val report splits cosine into vision vs text positions.
 
+seeded resampler packs (trainer / PixArt T5): the same masked whitened loss
+on RAW targets, the mask being the teacher window's real slots (pads are
+never supervised — the DiT never attends there), the queries seeded with
+the teacher token ids of the batch.
+
 Stop-at-any-time: the STOP file or SIGINT/SIGTERM saves last.pt atomically
 after the current step; the next run resumes step, optimizer, best-val
 tracking and the exact stream position.
@@ -34,7 +39,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .adapter import KIND_TOKEN_VISION, AdapterConfig, adapter_config_for, build_adapter
+from .adapter import KIND_RESAMPLER, KIND_SEEDED, KIND_TOKEN_VISION, AdapterConfig, adapter_config_for, build_adapter
 from .devices import device_index, pick_device
 from .shards import ShardStream, ValSet, load_stats
 from .util import replace_atomic, write_json_atomic
@@ -131,6 +136,35 @@ def validate_ta(adapter, val_set, device, cos_weight, inv_sigma):
             "val_cos_vis": v_sum / max(v_n, 1.0), "val_cos_txt": t_sum / max(t_n, 1.0)}
 
 
+# ---------------------------------------------------------------- seeded resampler
+
+def run_batch_seeded(adapter, batch, device, cos_weight, inv_sigma):
+    hidden = batch["qwen_hidden"].to(device).float()
+    keep = batch["keep"].to(device)
+    seed_ids = batch["seed_ids"].to(device)
+    target = batch["target"].to(device).float()
+    mask = batch["seed_mask"].to(device).float()
+    if device.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred = adapter(hidden, keep, seed_ids=seed_ids)
+    else:
+        pred = adapter(hidden, keep, seed_ids=seed_ids)
+    return masked_loss(pred, target, mask, cos_weight, inv_sigma)
+
+
+@torch.no_grad()
+def validate_seeded(adapter, val_set, device, cos_weight, inv_sigma):
+    adapter.eval()
+    tot_mse = tot_cos = 0.0
+    for batch in val_set:
+        _, rel_mse, cos, _ = run_batch_seeded(adapter, batch, device, cos_weight, inv_sigma)
+        tot_mse += rel_mse.item()
+        tot_cos += cos.item()
+    adapter.train()
+    n = max(1, len(val_set))
+    return {"val_rel_mse": tot_mse / n, "val_cos": tot_cos / n}
+
+
 # ---------------------------------------------------------------- loop
 
 def train(project, pack, log, report, should_stop) -> str:
@@ -150,6 +184,8 @@ def train(project, pack, log, report, should_stop) -> str:
     sigma_floor = float(tc["sigma_floor"])
     log_every, val_every, save_every = int(tc["log_every"]), int(tc["val_every"]), int(tc["save_every"])
     token_aligned = pack.adapter_kind == KIND_TOKEN_VISION
+    seeded = pack.adapter_kind == KIND_SEEDED
+    standardized = pack.adapter_kind == KIND_RESAMPLER      # the others train on raw targets
 
     mu, sigma, inv_sigma, floored = load_stats(train_dir, sigma_floor)
     log(f"target sigma: min {sigma.min():.3f} med {sigma.median():.3f} max {sigma.max():.3f}; {floored} dims floored")
@@ -221,6 +257,13 @@ def train(project, pack, log, report, should_stop) -> str:
 
         def validate_fn():
             return validate_ta(adapter, val_set, device, cos_weight, inv_sigma_dev)
+    elif seeded:
+        def step_fn(batch):
+            loss, rel_mse, cos, _ = run_batch_seeded(adapter, batch, device, cos_weight, inv_sigma_dev)
+            return loss, rel_mse, cos
+
+        def validate_fn():
+            return validate_seeded(adapter, val_set, device, cos_weight, inv_sigma_dev)
     else:
         def step_fn(batch):
             return run_batch(adapter, batch, device, cos_weight, stats)
@@ -245,7 +288,7 @@ def train(project, pack, log, report, should_stop) -> str:
         torch.save({"config": cfg.to_dict(), "model": adapter.state_dict(), "opt": opt.state_dict(),
                     "step": step, "train_config": dict(tc), "best_val_cos": best_val_cos,
                     "stream_state": stream.state(), "torch_rng": torch.get_rng_state(),
-                    "mu": mu, "sigma": sigma_f, "standardized": not token_aligned, "pack": pack.id,
+                    "mu": mu, "sigma": sigma_f, "standardized": standardized, "pack": pack.id,
                     "val": dict(val) if val_step == step else None}, tmp)
         with open(tmp, "rb+") as f:
             os.fsync(f.fileno())

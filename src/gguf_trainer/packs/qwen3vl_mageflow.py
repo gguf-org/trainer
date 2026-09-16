@@ -44,6 +44,7 @@ class Qwen3VLMageFlowPack(TrainerPack):
     vis_dim = V_DIM
     num_queries = 0
     needs_images = True
+    teacher_control = "teacher_mode"
     default_name = "qwen3vl_4b_adapter"
     max_len_student = 1024
     shard_contract = "qwen3vl_mageflow/1"

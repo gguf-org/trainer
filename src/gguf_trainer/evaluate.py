@@ -10,6 +10,13 @@ resampler packs:
   cos_centered  cosine after subtracting the per-dim target mean (judge this)
   rel_mse       relative MSE (scale-aware)
 
+seeded resampler packs (PixArt T5):
+  cos           per-slot cosine over the real teacher slots (judge this)
+  cos_rms       cosine after per-row RMSNorm
+  cos_eos       cosine at the EOS slot only (the hardest one)
+  rel_mse       relative MSE over the real slots
+  worst_row_cos the worst real slot in the val set
+
 token-aligned vision packs:
   cos           per-token cosine over every real token
   cos_vis / cos_txt   split by vision vs text positions
@@ -27,7 +34,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .adapter import KIND_TOKEN_VISION
+from .adapter import KIND_SEEDED, KIND_TOKEN_VISION
 from .devices import pick_device
 from .export import checkpoint_file, gguf_adapter_model, load_folded_model
 from .shards import ValSet
@@ -53,6 +60,8 @@ def evaluate(project, pack, log, gguf_path: Optional[pathlib.Path] = None, check
     val = ValSet(str(project.shards_dir / "val"), int(project.config["train"]["batch_size"]))
     if cfg.kind == KIND_TOKEN_VISION:
         res = _eval_token_aligned(model, ck_model, val, dev)
+    elif cfg.kind == KIND_SEEDED:
+        res = _eval_seeded(model, ck_model, val, dev)
     else:
         res = _eval_resampler(model, ck_model, val, dev, ck["mu"].to(dev))
     res.update({"gguf": str(gguf_path), "kind": cfg.kind, "trained_steps": int(kv.get("adapter.trained_steps", 0)),
@@ -83,6 +92,41 @@ def _eval_resampler(model, ck_model, val, dev, mu):
         n += 1
     res = {k: v / max(1, n) for k, v in sums.items()}
     res.update({"worst_row_cos_rms": worst_rms, "val_batches": n})
+    return res
+
+
+def _eval_seeded(model, ck_model, val, dev):
+    sums = {"cos": 0.0, "cos_rms": 0.0, "cos_eos": 0.0, "roundtrip_cos": 0.0}
+    ns = {"cos": 0.0, "cos_rms": 0.0, "cos_eos": 0.0, "roundtrip_cos": 0.0}
+    err = ref = 0.0
+    worst = 1.0
+    n_batches = 0
+    for b in val:
+        h = b["qwen_hidden"].to(dev).float()
+        keep = b["keep"].to(dev)
+        ids = b["seed_ids"].to(dev)
+        m = b["seed_mask"].to(dev)
+        t = b["target"].to(dev).float()
+        p = model(h, keep, seed_ids=ids).float()
+        p_ck = ck_model(h, keep, seed_ids=ids).float()
+        mf = m.float()
+        cos = F.cosine_similarity(p, t, dim=-1)
+        rt = F.cosine_similarity(p, p_ck, dim=-1)
+        c_rms = F.cosine_similarity(rms_norm(p), rms_norm(t), dim=-1)
+        # the EOS slot = the last real slot of each row
+        eos = torch.zeros_like(m)
+        eos[torch.arange(m.shape[0], device=dev), m.long().sum(1).clamp_min(1) - 1] = True
+        eos &= m
+        for key, val_, sel in (("cos", cos, m), ("cos_rms", c_rms, m), ("cos_eos", cos, eos),
+                               ("roundtrip_cos", rt, m)):
+            sums[key] += (val_ * sel).sum().item()
+            ns[key] += sel.sum().item()
+        worst = min(worst, cos[m].min().item())
+        err += (((p - t) ** 2) * mf.unsqueeze(-1)).sum().item()
+        ref += ((t ** 2) * mf.unsqueeze(-1)).sum().item()
+        n_batches += 1
+    res = {k: sums[k] / max(ns[k], 1.0) for k in sums}
+    res.update({"rel_mse": err / max(ref, 1e-8), "worst_row_cos": worst, "val_batches": n_batches})
     return res
 
 

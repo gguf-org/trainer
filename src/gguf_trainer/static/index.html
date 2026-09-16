@@ -164,7 +164,7 @@
               <option value="sequential">sequential — fill the chosen GPU first (recommended)</option>
               <option value="balanced">balanced — spread evenly over all GPUs</option>
             </select></label>
-            <label class="field-label precompute-vision" style="display:none">Teacher mode<select data-cfg="precompute.teacher_mode">
+            <label class="field-label" id="precompute-teacher-mode-field" style="display:none">Teacher mode<select data-cfg="precompute.teacher_mode">
               <option value="auto">auto — resident when it fits the GPU budget, else streamed</option>
               <option value="gpu">gpu — text stack resident on the GPU</option>
               <option value="offload">offload — weights in RAM, streamed through the GPU</option>

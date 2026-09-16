@@ -2,8 +2,9 @@
 
 Everything the engine needs is derived from tensor shapes (`adapter.query`
 [width, num_queries] selects the resampler variant, its absence the
-token-aligned one; `adapter.vision_proj.weight` selects the vision
-extension; head_dim 64).  Norms, biases, the query and vision_proj stay
+token-aligned one; `adapter.t5_embed.weight` the seeded resampler (query
+seed = the teacher tokenizer's ids); `adapter.vision_proj.weight` selects
+the vision extension; head_dim 64).  Norms, biases, the query and vision_proj stay
 f32, other 2-D weights go f16.  A resampler trained on standardized targets
 has the standardization folded into out_proj so the engine emits
 teacher-scale rows:  W' = diag(sigma) W,  b' = sigma * b + mu.
@@ -27,7 +28,7 @@ import torch
 from gguf_connector.reader import GGUFReader
 from gguf_connector.writer import GGUFWriter
 
-from .adapter import KIND_RESAMPLER, KIND_TOKEN_VISION, AdapterConfig, build_adapter
+from .adapter import KIND_RESAMPLER, KIND_SEEDED, KIND_TOKEN_VISION, AdapterConfig, build_adapter
 from .util import replace_atomic
 
 
@@ -85,7 +86,7 @@ def export_adapter(project, pack, log, checkpoint: str = "best", out: Optional[p
     w.add_uint32("adapter.width", cfg.width)
     w.add_uint32("adapter.depth", cfg.depth)
     w.add_uint32("adapter.heads", cfg.heads)
-    if cfg.kind == KIND_RESAMPLER:
+    if cfg.kind in (KIND_RESAMPLER, KIND_SEEDED):
         w.add_uint32("adapter.num_queries", cfg.num_queries)
     w.add_uint32("adapter.trained_steps", int(ck["step"]))
     w.add_uint32("adapter.planned_steps", planned)
@@ -126,8 +127,10 @@ def export_adapter(project, pack, log, checkpoint: str = "best", out: Optional[p
     if cfg.kind == KIND_TOKEN_VISION:
         assert "adapter.query" not in names and {"adapter.skip.weight", "adapter.vision_proj.weight",
                                                  "adapter.vis_in.weight"} <= names, "vision-ext layout"
+    elif cfg.kind == KIND_SEEDED:
+        assert {"adapter.query", "adapter.t5_embed.weight"} <= names, "seeded resampler layout"
     else:
-        assert "adapter.query" in names, "resampler layout"
+        assert "adapter.query" in names and "adapter.t5_embed.weight" not in names, "resampler layout"
     del r
     replace_atomic(tmp, out)
     log(f"export: wrote {out}: {n_f16} f16 + {n_f32} f32 tensors "
@@ -152,11 +155,13 @@ def gguf_adapter_model(path: pathlib.Path):
         shape = tuple(int(x) for x in reversed(t.shape))
         sd[t.name[len("adapter."):]] = torch.from_numpy(np.asarray(t.data).astype(np.float32).reshape(shape).copy())
     resampler = "query" in sd
+    seeded = resampler and "t5_embed.weight" in sd
     cfg = AdapterConfig(in_dim=int(kv["adapter.in_dim"]), out_dim=int(kv["adapter.out_dim"]),
                         width=int(kv["adapter.width"]), depth=int(kv["adapter.depth"]),
                         num_queries=int(kv.get("adapter.num_queries", sd["query"].shape[0] if resampler else 0)),
-                        kind=KIND_RESAMPLER if resampler else KIND_TOKEN_VISION,
-                        vis_dim=0 if resampler else int(kv.get("adapter.vis_dim", sd["vision_proj.weight"].shape[1])))
+                        kind=(KIND_SEEDED if seeded else KIND_RESAMPLER) if resampler else KIND_TOKEN_VISION,
+                        vis_dim=0 if resampler else int(kv.get("adapter.vis_dim", sd["vision_proj.weight"].shape[1])),
+                        seed_vocab=int(sd["t5_embed.weight"].shape[0]) if seeded else 0)
     model = build_adapter(cfg)
     model.load_state_dict(sd)
     return model.eval(), cfg, kv

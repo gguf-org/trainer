@@ -12,6 +12,10 @@ model's original text encoder in the **ggk** engine. Two trainer packs ship:
   `pig_clip` + a token-aligned adapter with a vision extension (the trainer5
   recipe); the adapter pairs with the unchanged
   `mmproj-qwen3vl-4b-it-f16.gguf` vision encoder for editing and text-to-image.
+* **PixArt** — the 4.7B T5-XXL v1.1 encoder (`--t5xxl`) is replaced by
+  `pig_clip` + a 120-query resampler seeded with the T5 token ids (the
+  original `trainer` recipe); the T5 *tokenizer* stays at inference, the
+  encoder is never loaded.
 
 Both packs train against `pig_clip-f16.gguf` (get it [here](https://huggingface.co/gguf-org/trainer/blob/main/pig_clip-f16.gguf)) as the student.
 
@@ -111,6 +115,65 @@ gguf-trainer download --project ~/gguf-trainer/projects/llada_adapter   # fetch 
 ```
 
 ![screenshot](https://raw.githubusercontent.com/gguf-org/ggk/master/media/trainer2.png)
+
+## Changing the number of training steps
+
+The planned step count (`train.steps`, default 20 000) is a setting like any
+other, not a fixed recipe: the **Steps** field on the Setup tab, the
+**planned steps** box on the Train tab (Apply), or the CLI change it, and the
+change is honoured at every point of a project's life:
+
+* **before the run** — the usual case (a quick 5k pilot, a long 40k run);
+* **while training runs** — the trainer re-reads `project.json` at every log
+  interval (`log_every`, default 25 steps). Lower the count to finish *now*:
+  the current step is validated and saved, then export and eval run as
+  usual. Raise it to keep going past the original plan;
+* **after a finished run** — a higher count un-finishes the training stage;
+  **Start / Resume** (or `gguf-trainer start`) continues from `last.pt`
+  (optimizer, RNG and shard position included) up to the new count, and the
+  GGUF is re-exported if `best.pt` improves.
+
+```bash
+gguf-trainer set   --project DIR --steps 12000      # also while it runs
+gguf-trainer start --project DIR --steps 40k        # set, then launch
+```
+
+The cosine learning-rate schedule is computed from the count in force, so
+extending a finished run lifts the lr back up mid-schedule (warm restart);
+snapshots and the exported GGUF record the planned count that was in force
+(`adapter.planned_steps`).
+
+## Snapshots: a usable GGUF at any step
+
+You do not have to wait for the last of the 20 000 steps. **Stop** pauses the
+run after the current step (Start / Resume continues it from `last.pt`), and
+**Export snapshot** (Train tab, Output tab, or the CLI) writes the adapter as
+it is *right now*:
+
+```bash
+gguf-trainer snapshot --project DIR                     # newest step, while training runs or after a stop
+gguf-trainer snapshot --project DIR --checkpoint best   # best validation score so far
+gguf-trainer snapshot --project DIR --eval              # + evaluate the GGUF on the val shards
+```
+
+* While the train stage is running the job drops a `SNAPSHOT` file; the
+  trainer validates and saves `last.pt` at the current step, removes the file
+  and keeps training — nothing is interrupted (a few seconds).
+  `--no-fresh` takes the checkpoint already on disk instead.
+* The file is step-tagged, `<name>-step<N>-f16.gguf`, next to the final
+  `<name>-f16.gguf`, so several points of one run can be kept and swapped
+  into the same engine command. The final export is not affected.
+* `<project>/snapshots.json` (Output tab › Snapshots) lists every snapshot
+  with its step, the planned steps, the validation cosine measured when the
+  checkpoint was saved and the optional eval — the steps-vs-quality trade-off
+  is visible instead of hidden behind the final export.
+* Provenance lives in the GGUF itself: `adapter.trained_steps`,
+  `adapter.planned_steps`, `adapter.checkpoint` (`last` / `best`),
+  `adapter.snapshot`, `adapter.val_cos`, `adapter.best_val_cos`.
+* The eval of a snapshot taken while training runs is done on the CPU
+  (the training process owns the GPU); `--device` overrides.
+* Resetting the training stage also clears the manifest; the snapshot files
+  are removed with the other exports by the "output" reset.
 
 ## The LLaDA-Image pack
 
@@ -230,6 +293,54 @@ and the **cos_vis / cos_txt** split: the trainer5 reference reached val cos
 near-identical to the teacher's — the 4-step DiT forgives far more than the
 cosine suggests. A lagging vision cosine means the `vis_in` path or the
 width is the limiter, not the student.
+
+## The PixArt / T5-XXL pack
+
+PixArt's DiT cross-attends to **T5-XXL v1.1** encoder output over a 120-slot
+caption window (4096-dim rows; pads carry a -10000 attention bias, so only
+the real tokens matter). The pack distills that conditioning into
+`pig_clip` + a **seeded resampler**: 120 learned queries, each seeded with
+the T5 sentencepiece embedding of its slot (`adapter.t5_embed.weight`),
+cross-attend over the student's final-norm states and are projected to
+4096. The seed is what lets a fixed query window follow T5's own
+segmentation over Qwen BPE states — without it the adapter plateaus barely
+above the per-position mean baseline (0.515 vs 0.455 measured).
+
+Contract (verified against the engine at cosine 0.999999 in `trainer/`):
+
+* student ids = the raw prompt through the Qwen BPE, no special tokens, an
+  empty prompt = the single pad token (`151643`);
+* seed ids = T5 sentencepiece + EOS, pad-0 to 120 — exactly the sequence
+  ggk's `PixArtT5Embedder` builds for its mask, so the ids are free at
+  inference; `query_i = query[i] + t5_embed[id_i]`;
+* target = `T5EncoderModel.last_hidden_state` at the real slots; the loss is
+  masked to them: MSE whitened by the per-dim sigma (floored at 0.03 — T5-XXL
+  has ~120 near-constant dims that otherwise carry half the loss as bf16
+  noise) + 0.5·(1−cos), on RAW targets (no standardization fold at export).
+
+The teacher is one dense 9.5 GB bf16 encoder: `teacher_mode` gpu keeps it
+resident (needs a ~12 GiB budget), offload streams the 24 layers from RAM
+through the GPU (a 6 GB card runs it at ~0.25 GiB of VRAM), and the batched
+teacher matches the original per-prompt full-window path bit for bit. Only
+the real slots are stored (~40 rows × 4096 per prompt, ~0.4 MB).
+
+Export: `pig_t5_adapter-f16.gguf` with the layout of the shipped file
+(`adapter.query` f32, `adapter.t5_embed.weight` f16 `[32128, width]`,
+explicit q/k/v/o linears, norms and biases f32, KV `adapter.t5_vocab`).
+
+```bash
+ggk diffuser engine -- --diffusion-model pixart-nvfp4.gguf \
+    --vae pig_pixart_vae_fp16-f16.gguf \
+    --llm pig_clip-q8_0.gguf --llm-adapter pig_t5_adapter-f16.gguf \
+    -p "close-up portrait of a young lady" --diffusion-fa -s 42 -o out.png
+```
+
+Judge a run by **cos** over the real slots and **rel_mse**; `cos_eos`
+isolates the EOS slot (the hardest one), `cos_rms` is the per-row-normalized
+view. The reference run reached val cos 0.827 at 12.5k steps on 117k
+prompts; both reference runs flattened around 0.80–0.83 — the 0.6B student's
+representation is the ceiling, not data. Use `pig_clip` at f16 or q8_0 in the
+engine: the 4-bit student loses ~0.09 cosine before the adapter even runs.
 
 ## Requirements
 

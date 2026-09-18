@@ -2,7 +2,7 @@
 
 A trainer GUI for **pig_clip adapters**: small bridge networks that let
 `pig_clip` (native train/fine-tune shipped as a GGUF) stand in for a diffusion
-model's original text encoder in the **ggk** engine. Two trainer packs ship:
+model's original text encoder in the **ggk** engine. Three trainer packs ship:
 
 * **LLaDA-Image-Turbo** — the 16B LLaDA2-MoE text stack is replaced by
   `pig_clip` + a 256-query resampler adapter (the trainer8 recipe); the
@@ -174,6 +174,8 @@ gguf-trainer snapshot --project DIR --eval              # + evaluate the GGUF on
   (the training process owns the GPU); `--device` overrides.
 * Resetting the training stage also clears the manifest; the snapshot files
   are removed with the other exports by the "output" reset.
+
+![screenshot](https://raw.githubusercontent.com/gguf-org/ggk/master/media/trainer3.png)
 
 ## The LLaDA-Image pack
 

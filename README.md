@@ -2,7 +2,7 @@
 
 A trainer GUI for **pig_clip adapters**: small bridge networks that let
 `pig_clip` (native train/fine-tune shipped as a GGUF) stand in for a diffusion
-model's original text encoder in the **ggk** engine. Three trainer packs ship:
+model's original text encoder in the **ggk** engine. Four trainer packs ship:
 
 * **LLaDA-Image-Turbo** — the 16B LLaDA2-MoE text stack is replaced by
   `pig_clip` + a 256-query resampler adapter (the trainer8 recipe); the
@@ -12,6 +12,11 @@ model's original text encoder in the **ggk** engine. Three trainer packs ship:
   `pig_clip` + a token-aligned adapter with a vision extension (the trainer5
   recipe); the adapter pairs with the unchanged
   `mmproj-qwen3vl-4b-it-f16.gguf` vision encoder for editing and text-to-image.
+* **Qwen-Image 2.1** — the Qwen3-VL-8B-Instruct text stack is replaced by
+  `pig_clip` + the same kind of adapter, distilled from the *full* Hugging
+  Face model (deepstack, M-RoPE image positions, pre-norm tap); text-to-image
+  needs only the adapter, editing pairs it with the unchanged
+  `mmproj-qwen3vl-8b-it-f16.gguf` vision encoder.
 * **PixArt** — the 4.7B T5-XXL v1.1 encoder (`--t5xxl`) is replaced by
   `pig_clip` + a 120-query resampler seeded with the T5 token ids (the
   original `trainer` recipe); the T5 *tokenizer* stays at inference, the
@@ -295,6 +300,73 @@ and the **cos_vis / cos_txt** split: the trainer5 reference reached val cos
 near-identical to the teacher's — the 4-step DiT forgives far more than the
 cosine suggests. A lagging vision cosine means the `vis_in` path or the
 width is the limiter, not the student.
+
+## The Qwen-Image 2.1 pack
+
+Qwen-Image 2.1 conditions its DiT on **Qwen3-VL-8B-Instruct**: the last
+decoder layer *before* the final RMSNorm, on one template for both modes
+(`<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n`
+— 14 tokens, dropped — then the user turn, with
+`<imageN><|vision_start|>…<|vision_end|>` blocks in front of the instruction
+when editing). The pack (`qwen3vl_qwenimage`) is the 8B sibling of the
+MageFlow pack — same adapter kind, same student, the same frozen
+`vision_proj` / trained `vis_in` bridge, here 4096 ↔ 1024 — and exports
+`pig_qwen3vl_8b_adapter-f16.gguf`:
+
+```
+--llm pig_clip-<quant>.gguf --llm-adapter pig_qwen3vl_8b_adapter-f16.gguf
+[--llm_vision mmproj-qwen3vl-8b-it-f16.gguf -r ref.png]
+```
+
+Three things differ from MageFlow, all of them the engine contract
+(`vision_data.QwenImage21Contract`) rather than the model size:
+
+* **The teacher is the unreduced model.** For MageFlow the teacher replicates
+  what ggk runs (no deepstack, plain 1-D rope, final norm). Here it is
+  Hugging Face's own forward — deepstack features added into the first
+  decoder layers, real (t, h, w) M-RoPE positions for the image tokens, and
+  the pre-norm tap (`qwen3vl_teacher.Qwen3VLFullTeacher`; it reproduces
+  `Qwen3VLModel(pixel_values=…)` to 2e-7 on a padded multi-image batch, the
+  rest being the bf16 the shards are stored in). The adapter still only ever
+  receives the mmproj's main output, so what deepstack told the teacher is
+  learned from that — which is also why the adapter route needs no deepstack
+  support in the engine.
+* **Only the rows the DiT reads are trained.** The 2.1 DiT substitutes the
+  reference latents for the context rows under the image slots (4 latent
+  tokens per slot) and drops the system turn, so the loss, the validation
+  scores and the target statistics cover the text rows from position 14 on.
+  Those rows sit after the image in a causal LM, so they are where the
+  image's influence on the conditioning lives. Taking the statistics over
+  the same rows matters with a pre-norm tap: its attention-sink rows would
+  otherwise own the whitening. Teacher rows under the slots are not stored.
+* **The vision token count follows the render size.** The engine resizes a
+  reference to the render area (nearest, both sides rounded to 32, alpha over
+  white, `2x − 1`), one slot per 32×32 px: 144 tokens at 384² up to 1024 at
+  1024². Each image sample draws its area from `corpus.ref_areas`
+  (`[[area_px, weight], …]`, default 384²/512²/768²/1024² at
+  0.35/0.35/0.20/0.10, deterministic per sample); two-image samples stay at or
+  below `corpus.two_image_max_area` each (default 512², for cost). The engine
+  gives *every* reference the full render area, so two-reference edits above
+  that size are outside what the adapter saw unless you raise it. Shards run ~0.6 MB per text sample and
+  3–11 MB per image sample — the default corpus (40k text, 30k image, 2k
+  two-image) is about 170 GB.
+
+The 17.5 GB teacher is resident on a 24 GB+ card; below that it is streamed
+through the GPU (`teacher_mode: offload`, RAM must hold it), which is slow at
+1024-token references — lower the weights of the large areas, or the image
+counts, for a first run on a small card.
+
+Judge a run by **cos_slice** (exactly the rows the DiT consumes), split into
+**cos_t2i** (text-only samples) and **cos_edit** (the text rows of image
+samples). A pre-norm tap has a few very large dimensions, so plain cosine
+runs high; compare runs by `rel_mse` as well. No reference run exists yet.
+
+On the ggk side this needs 0.6.6+: Qwen-Image 2.1 support, and for editing
+the 2.1 conditioner path that takes the references through the mmproj when an
+adapter with a vision extension is loaded (without one ggk refuses 2.1 edits,
+because it has no deepstack path). The engine and this pack were checked
+against each other: reference resize (pixel-index exact), template tokens and
+image slot positions for one and two references.
 
 ## The PixArt / T5-XXL pack
 

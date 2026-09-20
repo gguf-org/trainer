@@ -75,6 +75,20 @@ class Shard:
                 for k in range(len(z["vis_sample"])):
                     self.vis[int(z["vis_sample"][k])].append(
                         (int(z["vis_start"][k]), int(z["vis_len"][k]), int(v_off[k])))
+            # contracts that train on the consumed text rows only (vision_data.supervised_mask):
+            # teacher rows under the image slots are absent from t_pack (t_sparse) and
+            # rows before sup_start / under the slots are outside the loss
+            self.t_sparse = bool(int(z["t_sparse"][0])) if "t_sparse" in z else False
+            self.supervise = str(z["supervise"][0]) if "supervise" in z else "all"
+            if "sup_start" in z:
+                self.sup_start = z["sup_start"].astype(np.int64)
+            else:
+                # shards written before contracts existed are MageFlow-Edit's
+                from .vision_data import start_idx
+
+                self.sup_start = np.array([start_idx(int(n)) for n in self.n_images], dtype=np.int64)
+            n_vis = np.array([sum(n for _, n, _ in v) for v in self.vis], dtype=np.int64)
+            self.t_off = np.concatenate([[0], np.cumsum(self.len - n_vis)]) if self.t_sparse else self.off
 
     def batch(self, rows):
         B = len(rows)
@@ -117,15 +131,24 @@ class Shard:
         target = np.zeros((B, L, self.t_pack.shape[1]), dtype=np.int16)
         vis = np.zeros((B, L, self.vis_dim), dtype=np.int16) if self.vis_dim else None
         is_vis = np.zeros((B, L), dtype=bool)
+        sup = np.zeros((B, L), dtype=bool)
         for j, r in enumerate(rows):
             li = int(self.len[r])
-            target[j, :li] = self.t_pack[self.off[r]: self.off[r + 1]]
             hidden[j, :li] = self.q_pack[self.off[r]: self.off[r + 1]]
             keep[j, :li] = True
             for (st, n, vo) in self.vis[r]:
                 if vis is not None:
                     vis[j, st: st + n] = self.v_pack[vo: vo + n]
                 is_vis[j, st: st + n] = True
+            if self.t_sparse:
+                target[j, :li][~is_vis[j, :li]] = self.t_pack[self.t_off[r]: self.t_off[r + 1]]
+            else:
+                target[j, :li] = self.t_pack[self.off[r]: self.off[r + 1]]
+            if self.supervise == "consumed_text":
+                sup[j, int(self.sup_start[r]): li] = True
+                sup[j] &= ~is_vis[j]
+            else:
+                sup[j, :li] = True
         return {
             "prompts": [str(self.prompts[r]) for r in rows],
             "n_images": [int(self.n_images[r]) for r in rows],
@@ -134,6 +157,8 @@ class Shard:
             "vis": from_bits(vis) if vis is not None else None,
             "is_vis": torch.from_numpy(is_vis),
             "keep": torch.from_numpy(keep),
+            "sup": torch.from_numpy(sup),
+            "sup_start": [int(self.sup_start[r]) for r in rows],
         }
 
 

@@ -205,6 +205,202 @@ def start_idx(n_images: int) -> int:
     return EDIT_START_IDX if n_images else T2I_START_IDX
 
 
+# ---------------------------------------------------------------- contracts
+
+class VisionContract:
+    """What a vision pack's target engine does to a sample, in one object the
+    shared stages (precompute / train / evaluate) talk to.  The module-level
+    functions above ARE the MageFlow-Edit contract; `MageFlowContract` wraps
+    them unchanged, other engines subclass."""
+
+    id = "base"
+    factor = FACTOR
+    tap = "final_norm"
+    # which rows the adapter is trained and scored on:
+    #   "all"            every real token (MageFlow: trainer5 recipe)
+    #   "consumed_text"  text rows at/after the template start — for engines whose
+    #                    DiT discards the context rows under the image slots
+    supervise = "all"
+    # False: teacher rows under the image slots are not written to the shards
+    store_vision_targets = True
+    # validation split shown next to val cos: (first, second) captions
+    val_split_labels = ("vision", "text")
+    probe_counts = (144,)          # vision token counts used by the tokenizer cross-check
+
+    def assert_template_counts(self, tok) -> None:
+        raise NotImplementedError
+
+    def build_sample(self, tok, text: str, image_token_counts: Sequence[int]):
+        raise NotImplementedError
+
+    def preprocess_ref_image(self, path, key: str = "", slot: int = 0, n_slots: int = 1):
+        """-> ([h, w, 3] float32 as the vision tower expects it, n_tokens).
+        `key` identifies the sample (stable across runs) for contracts that
+        pick a per-sample resolution."""
+        raise NotImplementedError
+
+    def start_idx(self, n_images: int) -> int:
+        raise NotImplementedError
+
+
+class MageFlowContract(VisionContract):
+    id = "mageflow_edit"
+
+    def assert_template_counts(self, tok) -> None:
+        assert_template_counts(tok)
+
+    def build_sample(self, tok, text, image_token_counts):
+        return build_sample(tok, text, image_token_counts)
+
+    def preprocess_ref_image(self, path, key: str = "", slot: int = 0, n_slots: int = 1):
+        return preprocess_ref_image(path)
+
+    def start_idx(self, n_images: int) -> int:
+        return start_idx(n_images)
+
+
+QI21_SYSTEM = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+QI21_USER = "<|im_start|>user\n"
+QI21_START_IDX = 14
+# (ref area in px, weight): the engine resizes a reference to the OUTPUT area
+# (or --ref-image max pixels), so the vision token count follows the render
+# size: 144 / 256 / 576 / 1024 tokens.  Weighted toward the cheap end; every
+# size the engine can produce must be seen at least sometimes.
+QI21_DEFAULT_REF_AREAS = ((384 * 384, 0.35), (512 * 512, 0.35), (768 * 768, 0.20), (1024 * 1024, 0.10))
+
+
+class QwenImage21Contract(VisionContract):
+    """Qwen-Image 2.1 conditioning (ggk conditioner.hpp VERSION_QWEN_IMAGE_2_1,
+    diffusers QwenImage21Pipeline._get_qwen_prompt_embeds):
+
+        <|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n   14 tok, dropped
+        <|im_start|>user\n
+        per image i:  (" " if i else "") "<image{i+1}><|vision_start|>"
+                      "<|image_pad|>" * n  "<|vision_end|>"
+        {text or " "}<|im_end|>\n<|im_start|>assistant\n
+
+    One template for both modes; the DiT consumes rows [14:].  Tap: the last
+    decoder layer BEFORE the final RMSNorm.  The rows under the image slots
+    are discarded by the DiT (it substitutes the reference latents there, 4
+    latent tokens per slot), so only text rows are supervised — but those
+    rows sit after the image in a causal LM and carry what the teacher read
+    off it, deepstack included.
+
+    Reference image, as the engine hands it to the vision tower: NEAREST
+    resize straight to (w_bar, h_bar) — no crop — where the area is the
+    render area and both sides are rounded to 32; alpha over white; 2x - 1
+    (Qwen3-VL's own mean/std 0.5).  The slot count is tied to the reference
+    latent grid, so the tower resolution is not a free choice.
+    """
+
+    id = "qwen_image_2_1"
+    tap = "pre_norm_last_layer"
+    supervise = "consumed_text"
+    store_vision_targets = False
+    val_split_labels = ("edit", "t2i")
+    probe_counts = (144, 256)
+
+    def __init__(self, ref_areas=None, two_image_max_area: int = 512 * 512):
+        areas = [(int(a), float(w)) for a, w in (ref_areas or QI21_DEFAULT_REF_AREAS) if float(w) > 0 and int(a) > 0]
+        if not areas:
+            raise ValueError("ref_areas: need at least one (area, weight) with a positive weight")
+        self.ref_areas = areas
+        self.two_image_max_area = int(two_image_max_area)
+        self._checked: Dict[int, bool] = {}
+
+    # -- images --
+    @staticmethod
+    def target_size(width: int, height: int, area: int) -> Tuple[int, int]:
+        """gk-diffuser.cpp ref resize: vae_w = sqrt(area * w / h) (integer
+        product, double sqrt), vae_h = vae_w * h / w, each rounded to 32."""
+        vw = float(np.sqrt(np.float64((int(area) * int(width)) // int(height))))
+        vh = vw * int(height) / int(width)
+        f = float(FACTOR)
+        h_bar = max(FACTOR, int(round(vh / f) * f))
+        w_bar = max(FACTOR, int(round(vw / f) * f))
+        return w_bar, h_bar
+
+    def pick_area(self, key: str, n_slots: int = 1) -> int:
+        """Deterministic per sample (a re-run must rebuild identical shards)."""
+        import hashlib
+
+        areas = self.ref_areas
+        if n_slots > 1:
+            capped = [(a, w) for a, w in areas if a <= self.two_image_max_area]
+            areas = capped or [min(areas)]
+        u = int.from_bytes(hashlib.sha1(key.encode("utf-8")).digest()[:8], "big") / float(1 << 64)
+        tot = sum(w for _, w in areas)
+        acc = 0.0
+        for a, w in areas:
+            acc += w / tot
+            if u < acc:
+                return a
+        return areas[-1][0]
+
+    def preprocess_ref_image(self, path, key: str = "", slot: int = 0, n_slots: int = 1):
+        from PIL import Image
+
+        with Image.open(path) as im:
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                rgba = np.asarray(im.convert("RGBA"), dtype=np.float32) / 255.0
+                alpha = rgba[..., 3:4]
+                img = rgba[..., :3] * alpha + (1.0 - alpha)          # composited over white
+            else:
+                img = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
+        h, w = img.shape[:2]
+        # every image of a sample shares the render area -> one area per sample
+        w_bar, h_bar = self.target_size(w, h, self.pick_area(key, n_slots))
+        r = nearest_resize(img, w_bar, h_bar)
+        return (2.0 * r - 1.0).astype(np.float32), n_image_tokens(w_bar, h_bar)
+
+    # -- tokens --
+    def assert_template_counts(self, tok) -> None:
+        if self._checked.get(id(tok)):
+            return
+        n = len(tok(QI21_SYSTEM, add_special_tokens=False)["input_ids"])
+        if n != QI21_START_IDX:
+            raise RuntimeError(f"Qwen-Image 2.1 system turn tokenizes to {n} tokens, expected {QI21_START_IDX}")
+        self._checked[id(tok)] = True
+
+    def build_sample(self, tok, text, image_token_counts):
+        self.assert_template_counts(tok)
+        body = ""
+        for i, n in enumerate(image_token_counts):
+            body += ("" if i == 0 else " ") + f"<image{i + 1}><|vision_start|>" + "<|image_pad|>" * n + "<|vision_end|>"
+        # Qwen has no bos token: an empty prompt would leave nothing to read
+        ids = tok(QI21_SYSTEM + QI21_USER + body + (text or " ") + SUFFIX, add_special_tokens=False)["input_ids"]
+        vis_segments: List[Tuple[int, int]] = []
+        i = 0
+        while i < len(ids):
+            if ids[i] == IMAGE_PAD_ID:
+                j = i
+                while j < len(ids) and ids[j] == IMAGE_PAD_ID:
+                    j += 1
+                vis_segments.append((i, j - i))
+                i = j
+            else:
+                i += 1
+        if [n for _, n in vis_segments] != list(image_token_counts):
+            raise RuntimeError(f"image slots {vis_segments} do not match the requested counts {list(image_token_counts)}")
+        for start, n in vis_segments:
+            if ids[start - 1] != VISION_START_ID or ids[start + n] != VISION_END_ID:
+                raise RuntimeError("vision_start/end tokens are not around the image slots")
+        return ids, vis_segments
+
+    def start_idx(self, n_images: int) -> int:
+        return QI21_START_IDX
+
+
+def supervised_mask(contract: VisionContract, length: int, vis_segments, n_images: int) -> np.ndarray:
+    """[length] bool: the rows this contract trains and scores on."""
+    m = np.ones(length, dtype=bool)
+    if contract.supervise == "consumed_text":
+        m[: contract.start_idx(n_images)] = False
+        for st, n in vis_segments:
+            m[st: st + n] = False
+    return m
+
+
 # ---------------------------------------------------------------- image sources
 
 IMAGE_PRESETS: Dict[str, Dict[str, object]] = {

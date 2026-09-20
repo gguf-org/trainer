@@ -49,10 +49,15 @@ def patchify(img: np.ndarray, patch: int, merge: int, temporal: int):
 class VisionEncoder:
     """GPU-resident Qwen3-VL vision tower; returns the merged main embeds."""
 
-    def __init__(self, visual, device, patch: int, merge: int, temporal: int, dtype=torch.bfloat16):
+    def __init__(self, visual, device, patch: int, merge: int, temporal: int, dtype=torch.bfloat16,
+                 keep_deepstack: bool = False):
         self.m = visual.to(device=device, dtype=dtype).eval().requires_grad_(False)
         self.device, self.dtype = device, dtype
         self.patch, self.merge, self.temporal = patch, merge, temporal
+        # True: every returned main tensor carries `.deepstack` (list of
+        # [n_tokens, D] bf16 cpu, one per deepstack layer) and `.grid` (h, w in
+        # merged tokens) for a teacher that feeds them to the text stack
+        self.keep_deepstack = keep_deepstack
 
     @torch.no_grad()
     def encode(self, imgs: Sequence[np.ndarray]) -> List[torch.Tensor]:
@@ -68,11 +73,18 @@ class VisionEncoder:
         pixel = torch.cat(packs).to(self.device, self.dtype)
         grid_thw = torch.tensor(grids, dtype=torch.long, device=self.device)
         out = self.m(hidden_states=pixel, grid_thw=grid_thw)
-        merged = out.pooler_output if hasattr(out, "pooler_output") else out[1]   # deepstack unused
+        merged = out.pooler_output if hasattr(out, "pooler_output") else out[1]
+        deep = []
+        if self.keep_deepstack:
+            deep = list(out.deepstack_features if hasattr(out, "deepstack_features") else out[2])
         outs, o = [], 0
         for (_, gh, gw) in grids:
             n = (gh // self.merge) * (gw // self.merge)
-            outs.append(merged[o: o + n].to(torch.bfloat16).cpu())
+            main = merged[o: o + n].to(torch.bfloat16).cpu()
+            if self.keep_deepstack:
+                main.deepstack = [d[o: o + n].to(torch.bfloat16).cpu() for d in deep]
+                main.grid = (gh // self.merge, gw // self.merge)
+            outs.append(main)
             o += n
         assert o == merged.shape[0], (o, merged.shape)
         return outs
@@ -138,16 +150,17 @@ def check_inv_freq_buffers(model) -> None:
 # ---------------------------------------------------------------- teacher
 
 class Qwen3VLTeacher:
-    """Qwen3-VL-4B-Instruct as the engine runs it (see module docstring)."""
+    """Qwen3-VL-4B-Instruct as the engine runs it for MageFlow (see module
+    docstring).  Qwen3VLFullTeacher below is the unreduced HF model."""
 
     def __init__(self, root: pathlib.Path, device: torch.device, gpu_mem_gib: float, teacher_mode: str = "auto",
-                 log=print):
+                 log=print, dtype: torch.dtype = torch.bfloat16):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
         root = pathlib.Path(root)
         self.root = root
         self.dev = device
-        self.dtype = torch.bfloat16
+        self.dtype = dtype              # bf16 = the released weights; f32 only for reference checks
         t0 = time.time()
         self.tok = AutoTokenizer.from_pretrained(str(root))
         cfg = AutoConfig.from_pretrained(str(root))
@@ -171,7 +184,8 @@ class Qwen3VLTeacher:
         m = AutoModel.from_pretrained(str(root), dtype=self.dtype)
         m.eval().requires_grad_(False)
         check_inv_freq_buffers(m)
-        self.visual = VisionEncoder(m.visual, "cpu" if mode == "cpu" else device, self.patch, self.merge, self.temporal)
+        self.visual = VisionEncoder(m.visual, "cpu" if mode == "cpu" else device, self.patch, self.merge, self.temporal,
+                                    dtype=self.dtype, keep_deepstack=getattr(self, "keep_deepstack", False))
         self.text = m.language_model
         self.embed_weight = self.text.embed_tokens.weight.detach()
         if mode == "gpu":
@@ -185,7 +199,8 @@ class Qwen3VLTeacher:
         else:
             torch.set_num_threads(os.cpu_count() or 4)
         self.input_dev = torch.device("cpu") if mode == "cpu" else device
-        log(f"teacher up in {time.time() - t0:.0f}s ({len(self.text.layers)} layers + final norm, deepstack dropped)")
+        log(f"teacher up in {time.time() - t0:.0f}s ({len(self.text.layers)} layers + final norm, deepstack "
+            f"{'kept' if getattr(self, 'keep_deepstack', False) else 'dropped'})")
 
     def encode_images(self, imgs: Sequence[np.ndarray]) -> List[torch.Tensor]:
         return self.visual.encode(imgs)
@@ -198,6 +213,91 @@ class Qwen3VLTeacher:
 
     def embed_table(self) -> torch.Tensor:
         return self.embed_weight.detach().float().cpu()
+
+
+def mrope_positions(length: int, vis_segments, grids) -> torch.Tensor:
+    """Qwen3-VL M-RoPE position ids of one sample -> [3, length] long
+    (temporal, height, width).  Text tokens advance all three axes together;
+    an image block of (h, w) merged tokens starting at position p gets
+    t = p, h = p + row, w = p + col, and the text after it resumes at
+    p + max(h, w) — Qwen3VLModel.get_rope_index for still images, written
+    out so it does not depend on that method's version-specific signature
+    (verified against the full HF forward)."""
+    pos = torch.zeros(3, length, dtype=torch.long)
+    nxt, cur = 0, 0
+    for (start, n), (gh, gw) in zip(vis_segments, grids):
+        assert gh * gw == n, (gh, gw, n)
+        k = start - cur
+        pos[:, cur:start] = torch.arange(nxt, nxt + k)[None]
+        nxt += k
+        rows = torch.arange(gh).repeat_interleave(gw)
+        cols = torch.arange(gw).repeat(gh)
+        pos[0, start: start + n] = nxt
+        pos[1, start: start + n] = nxt + rows
+        pos[2, start: start + n] = nxt + cols
+        nxt += max(gh, gw)
+        cur = start + n
+    pos[:, cur:] = torch.arange(nxt, nxt + (length - cur))[None]
+    return pos
+
+
+class Qwen3VLFullTeacher(Qwen3VLTeacher):
+    """Qwen3-VL as Hugging Face runs it — the reference the Qwen-Image 2.1 DiT
+    was trained on, NOT the reduced path ggk runs for MageFlow:
+
+      - deepstack ON: the tower's intermediate mergers are added to the first
+        decoder layers at the image positions;
+      - real M-RoPE: image tokens get (t, h, w) positions (mrope_positions);
+      - tap = the last decoder layer BEFORE the final RMSNorm
+        (diffusers QwenImage21Pipeline hooks the norm the same way; from
+        transformers 5 `hidden_states[-1]` is the NORMALIZED state).
+
+    The adapter still receives only the tower's main output (what the mmproj
+    GGUF produces), so what deepstack contributed has to be learned from it.
+    """
+
+    keep_deepstack = True
+
+    def __init__(self, root, device, gpu_mem_gib, teacher_mode="auto", log=print, dtype: torch.dtype = torch.bfloat16):
+        super().__init__(root, device, gpu_mem_gib, teacher_mode, log, dtype=dtype)
+        # a forward hook that returns the module's input replaces its output
+        self.text.norm.register_forward_hook(lambda module, args, output: args[0])
+        log("teacher tap: last decoder layer, pre final norm; deepstack + M-RoPE image positions on")
+
+    @torch.no_grad()
+    def hidden(self, batch: List[dict]) -> torch.Tensor:
+        """-> [B, L, out_dim] bf16 cpu PRE-NORM last-layer hidden states."""
+        lens = [len(s["ids"]) for s in batch]
+        B, L = len(batch), max(lens)
+        dev_e = self.embed_weight.device
+        D = self.embed_weight.shape[1]
+        embeds = torch.zeros(B, L, D, dtype=self.dtype, device=dev_e)
+        pos = torch.ones(3, B, L, dtype=torch.long)
+        vmask = torch.zeros(B, L, dtype=torch.bool)
+        deep: List[List[torch.Tensor]] = []
+        for j, s in enumerate(batch):
+            ids = torch.as_tensor(s["ids"], dtype=torch.long, device=dev_e)
+            e = self.embed_weight[ids].to(self.dtype)
+            vv = s.get("vis_embeds") or []
+            if vv:
+                e = splice(e, s["vis"], [v.to(dev_e, self.dtype) for v in vv])
+            embeds[j, : lens[j]] = e
+            pos[:, j, : lens[j]] = mrope_positions(lens[j], s.get("vis") or [], [v.grid for v in vv])
+            for (st, n), v in zip(s.get("vis") or [], vv):
+                vmask[j, st: st + n] = True
+                for k, d in enumerate(v.deepstack):
+                    if len(deep) <= k:
+                        deep.append([])
+                    deep[k].append(d)
+        tgt = self.input_dev
+        mask = (torch.arange(L)[None, :] < torch.as_tensor(lens)[:, None]).long()
+        kw = {}
+        if deep:
+            # row-major over [B, L]: the order the text stack reads the masked positions in
+            kw = {"visual_pos_masks": vmask.to(tgt),
+                  "deepstack_visual_embeds": [torch.cat(d).to(tgt, self.dtype) for d in deep]}
+        out = self.text(inputs_embeds=embeds.to(tgt), attention_mask=mask.to(tgt), position_ids=pos.to(tgt), **kw)
+        return out.last_hidden_state.to(torch.bfloat16).cpu()
 
 
 def _param_bytes(root: pathlib.Path, exclude_prefix: str = "") -> int:

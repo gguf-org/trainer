@@ -787,7 +787,11 @@ function renderPipeline() {
     ['step', tr.step != null ? `${tr.step} / ${tr.steps}` : (art.train.step != null ? `${art.train.step} / ${art.train.steps}` : '—')],
     ['loss', fmtNum(tr.loss)], ['rel_mse', fmtNum(tr.rel_mse)], ['cos', fmtNum(tr.cos)],
     ['val cos', fmtNum(tr.val_cos)], ['best val cos', fmtNum(tr.best_val_cos)],
-    ...(tr.val_cos_vis != null ? [['val cos (vision)', fmtNum(tr.val_cos_vis)], ['val cos (text)', fmtNum(tr.val_cos_txt)]] : []),
+    // the two-way validation split is the pack's: vision | text rows, or edit | t2i samples
+    ...(tr.val_cos_vis != null ? (() => {
+      const lb = (packInfo().val_split_labels || []).length === 2 ? packInfo().val_split_labels : ['vision', 'text'];
+      return [[`val cos (${lb[0]})`, fmtNum(tr.val_cos_vis)], [`val cos (${lb[1]})`, fmtNum(tr.val_cos_txt)]];
+    })() : []),
     ['lr', tr.lr != null ? Number(tr.lr).toExponential(2) : '—'],
     ['prompts/s', tr.prompts_per_s != null ? Number(tr.prompts_per_s).toFixed(1) : '—'],
     ['ETA', tr.status === 'running' ? fmtDur(tr.eta_s) : '—'],

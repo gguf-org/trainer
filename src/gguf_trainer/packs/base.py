@@ -78,6 +78,7 @@ class TrainerPack:
     #   "placement"    accelerate device_map over GPUs + CPU RAM (LLaDA)
     #   "teacher_mode" resident | streamed through the GPU (single dense model)
     teacher_control = "placement"
+    budget_scale = 1.0             # vision packs: multiplies the automatic precompute batch budgets
     default_name = "adapter"       # project / GGUF name suggestion (pig_ prefix added)
     max_len_student = 512
     # Bumped whenever the teacher targets change meaning; shards written
@@ -100,8 +101,22 @@ class TrainerPack:
                 "teacher_control": self.teacher_control, "default_name": self.default_name,
                 "sample_bytes": self.sample_bytes(project.config if project is not None else self.defaults()),
                 "hints": dict(self.hints), "eval_keys": list(self.eval_keys),
+                "val_split_labels": list(self.val_split_labels(project)),
                 "materials": [m.to_dict() for m in self.materials(project)],
                 "engine_command": self.engine_command("<pig_clip.gguf>", "<adapter.gguf>")}
+
+    def contract(self, project=None):
+        """token_aligned_vision packs: the engine's conditioning contract
+        (vision_data.VisionContract).  Default = MageFlow-Edit."""
+        if self.adapter_kind != "token_aligned_vision":
+            return None
+        from ..vision_data import MageFlowContract
+
+        return MageFlowContract()
+
+    def val_split_labels(self, project=None) -> List[str]:
+        c = self.contract(project)
+        return list(c.val_split_labels) if c is not None else []
 
     def materials(self, project=None) -> List[Material]:
         raise NotImplementedError

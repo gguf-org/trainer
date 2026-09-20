@@ -14,7 +14,10 @@ contract are discarded (with the checkpoints trained on them) and rebuilt.
   token-aligned vision packs ((image, instruction) jsonl corpus):
     prompts [S]  n_images [S]  t_pack [T, out_dim]  q_pack [T, in_dim]
     v_pack [Tv, vis_dim] + vis_sample/vis_start/vis_len segment table
-    len [S]  ids [T]  stat_s/stat_s2/stat_n over every real token
+    len [S]  ids [T]  sup_start [S]  supervise  t_sparse
+    stat_s/stat_s2/stat_n over the rows the pack's VisionContract supervises
+    (every real token for MageFlow).  t_sparse = 1: t_pack holds only the rows
+    outside the image slots, [T - Tv, out_dim] (contracts whose DiT discards them)
 """
 
 from __future__ import annotations
@@ -90,14 +93,16 @@ def write_shard_contract(project, split: str) -> None:
     (d / project.SHARD_CONTRACT_FILE).write_text(project.shard_contract() + "\n", encoding="utf-8")
 
 
-def auto_budgets(pc: dict, dev: torch.device) -> dict:
+def auto_budgets(pc: dict, dev: torch.device, scale: float = 1.0) -> dict:
     """0 = pick for the card: a 6 GB laptop GPU vs a 24 GB+ desktop card
-    (trainer5's two profiles)."""
+    (trainer5's two profiles, measured with the 4B teacher).  `scale` is the
+    pack's correction for a teacher that leaves less room (TrainerPack.budget_scale);
+    values set in the project are used as they are."""
     big = dev.type == "cuda" and torch.cuda.get_device_properties(device_index(dev)).total_memory > 24e9
     defaults = {"teacher_batch": (512 if big else 128), "tok_budget": (65536 if big else 12288),
                 "student_batch": (256 if big else 64), "student_tok_budget": (131072 if big else 24576),
                 "vis_tok_budget": (8192 if big else 1024)}
-    return {k: (int(pc.get(k) or 0) or v) for k, v in defaults.items()}
+    return {k: (int(pc.get(k) or 0) or max(1, int(v * scale))) for k, v in defaults.items()}
 
 
 def auto_budgets_seeded(pc: dict, dev: torch.device) -> dict:
@@ -182,31 +187,30 @@ class PrecomputeContext:
             self.budgets = auto_budgets_seeded(pc, self.dev)
             log(f"precompute budgets: {self.budgets}")
         if self.kind == "token_aligned_vision":
-            from .vision_data import assert_template_counts
-
-            assert_template_counts(self.tok)
+            self.contract = pack.contract(project)
+            self.contract.assert_template_counts(self.tok)
             if not self.mock:
                 self._check_tokenizers()
             self.s_embed = self.student.embed_tokens.weight.detach()
             w = ensure_vision_proj(project, pack, None if self.mock else self.teacher, self.s_embed.float().cpu(), log)
             self.w_vis = w.to(self.dev)
-            self.budgets = auto_budgets(pc, self.dev)
+            self.budgets = auto_budgets(pc, self.dev, float(getattr(pack, "budget_scale", 1.0)))
             log(f"precompute budgets: {self.budgets}")
             self.data_root = project.data_dir
 
     def _check_tokenizers(self):
         """teacher and student must tokenize the templated prompts identically
         (both are the Qwen BPE; trainer5 asserted it, so do we)."""
-        from .vision_data import build_sample
-
         ttok = getattr(self.teacher, "tok", None)
         if ttok is None:
             return
+        counts = list(self.contract.probe_counts)
         for p in ["a sheep in sunglasses", "make it night", "", "Add snow, heavy"]:
-            a, _ = build_sample(self.tok, p, [144])
-            b, _ = build_sample(ttok, p, [144])
-            if a != b:
-                raise RuntimeError(f"teacher/student tokenizer mismatch on {p!r}")
+            for cs in ([], counts[:1], counts):
+                a, _ = self.contract.build_sample(self.tok, p, cs)
+                b, _ = self.contract.build_sample(ttok, p, cs)
+                if a != b:
+                    raise RuntimeError(f"teacher/student tokenizer mismatch on {p!r} ({len(cs)} images)")
 
     def run_split(self, split: str, report, should_stop) -> bool:
         """-> True when every shard of the split exists, False when stopped."""
@@ -426,9 +430,11 @@ class PrecomputeContext:
     # ------------------------------------------------------------ token-aligned + vision
     def _run_split_token_aligned(self, split: str, report, should_stop) -> bool:
         from .qwen3vl_teacher import batched_hidden
-        from .vision_data import build_sample, preprocess_ref_image
+        from .vision_data import supervised_mask
 
         project, pack, log = self.project, self.pack, self.log
+        contract = self.contract
+        sparse = not contract.store_vision_targets
         discard_stale_shards(project, split, log)
         samples, size, out_dir, n_shards, todo = shard_plan(project, split)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -468,14 +474,15 @@ class PrecomputeContext:
                 text = s.get("text", "") if isinstance(s, dict) else str(s)
                 rels = (s.get("images") or []) if isinstance(s, dict) else []
                 imgs, counts = [], []
-                for rel in rels:
+                key = "|".join([str(r) for r in rels] + [text])     # stable per sample
+                for slot, rel in enumerate(rels):
                     p = pathlib.Path(rel)
                     if not p.is_absolute():
                         p = self.data_root / rel
-                    im, n = preprocess_ref_image(p)
+                    im, n = contract.preprocess_ref_image(p, key=key, slot=slot, n_slots=len(rels))
                     imgs.append(im)
                     counts.append(n)
-                ids, vis = build_sample(self.tok, text, counts)
+                ids, vis = contract.build_sample(self.tok, text, counts)
                 if len(ids) > pack.max_len_student:
                     raise RuntimeError(f"sample of {len(ids)} tokens exceeds max_len {pack.max_len_student} "
                                        f"(shorten max_chars or use smaller images): {text[:60]!r}")
@@ -518,7 +525,20 @@ class PrecomputeContext:
             off = np.zeros(S + 1, dtype=np.int64)
             np.cumsum(lens, out=off[1:])
             T = int(off[-1])
-            t_pack = np.empty((T, T_DIM), dtype=np.int16)
+            # rows the contract trains on; `sparse` contracts keep teacher rows
+            # only where there is no image slot (the DiT never reads those)
+            sup = [supervised_mask(contract, int(lens_all[r]), prepped[r]["vis"], prepped[r]["n_imgs"]) for r in order]
+            t_keep = []
+            for gi, r in enumerate(order):
+                rows_kept = np.ones(int(lens[gi]), dtype=bool)
+                if sparse:
+                    for st, n in prepped[r]["vis"]:
+                        rows_kept[st: st + n] = False
+                t_keep.append(rows_kept)
+            t_len = np.array([int(m.sum()) for m in t_keep], dtype=np.int64)
+            t_off = np.zeros(S + 1, dtype=np.int64)
+            np.cumsum(t_len, out=t_off[1:])
+            t_pack = np.empty((int(t_off[-1]), T_DIM), dtype=np.int16)
             q_pack = np.empty((T, S_DIM), dtype=np.int16)
             ids_pack = np.empty(T, dtype=np.int32)
             vis_sample, vis_start, vis_len, v_rows = [], [], [], []
@@ -533,6 +553,7 @@ class PrecomputeContext:
             v_pack = np.concatenate(v_rows) if v_rows else np.empty((0, V_DIM), dtype=np.int16)
             s_stat = np.zeros(T_DIM, dtype=np.float64)
             s2_stat = np.zeros(T_DIM, dtype=np.float64)
+            n_stat = 0
 
             def hf_batch(rows):
                 return [{"ids": prepped[order[g]]["ids"], "vis": prepped[order[g]]["vis"],
@@ -548,10 +569,14 @@ class PrecomputeContext:
                 hidden = self.teacher.hidden(hf_batch(rows))                    # [b, L, T_DIM] bf16 cpu
                 for j, gi in enumerate(rows):
                     li = int(lens[gi])
-                    t_pack[off[gi]: off[gi + 1]] = bf16_bits(hidden[j, :li])
-                    v = hidden[j, :li].double().numpy()
+                    t_pack[t_off[gi]: t_off[gi + 1]] = bf16_bits(hidden[j, :li][torch.from_numpy(t_keep[gi])])
+                    # target statistics over the supervised rows only: a pre-norm
+                    # tap carries attention-sink rows whose magnitude would
+                    # otherwise own the whitening
+                    v = hidden[j, :li][torch.from_numpy(sup[gi])].double().numpy()
                     s_stat += v.sum(axis=0)
                     s2_stat += (v * v).sum(axis=0)
+                    n_stat += int(sup[gi].sum())
                 report({"done_shards": n_shards - len(todo) + k, "total_shards": n_shards,
                         "shard_progress": b1 / S, "prompts": len(samples)})
             t_teacher = time.time() - tt
@@ -574,11 +599,14 @@ class PrecomputeContext:
                      vis_sample=np.array(vis_sample, dtype=np.int32), vis_start=np.array(vis_start, dtype=np.int32),
                      vis_len=np.array(vis_len, dtype=np.int32),
                      len=lens.astype(np.int32), ids=ids_pack,
-                     stat_s=s_stat, stat_s2=s2_stat, stat_n=np.array([T]), num_queries=np.array([0]),
+                     sup_start=np.array([contract.start_idx(prepped[r]["n_imgs"]) for r in order], dtype=np.int32),
+                     t_sparse=np.array([1 if sparse else 0]), supervise=np.array([contract.supervise]),
+                     stat_s=s_stat, stat_s2=s2_stat, stat_n=np.array([n_stat]), num_queries=np.array([0]),
                      meta=np.array([json.dumps({"pack": pack.id, "student": self.student_name,
                                                 "contract": project.shard_contract(), "mock_teacher": self.mock,
                                                 "teacher_mode": getattr(self.teacher, "mode", "?"),
-                                                "tap": "final_norm", "storage": "bf16_bits",
+                                                "tap": contract.tap, "vision_contract": contract.id,
+                                                "storage": "bf16_bits",
                                                 "shard": si, "time": time.time()})]))
             with open(tmp, "rb+") as f:
                 os.fsync(f.fileno())

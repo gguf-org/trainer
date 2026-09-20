@@ -131,10 +131,13 @@ def _eval_seeded(model, ck_model, val, dev):
 
 
 def _eval_token_aligned(model, ck_model, val, dev):
-    from .vision_data import start_idx
-
-    tok_sum = {"cos": 0.0, "cos_vis": 0.0, "cos_txt": 0.0, "roundtrip_cos": 0.0}
-    tok_n = {"cos": 0.0, "cos_vis": 0.0, "cos_txt": 0.0, "roundtrip_cos": 0.0}
+    """Scores the rows the pack's contract supervises (batch["sup"]; every real
+    token for MageFlow).  cos_vis / cos_txt = vision rows | text rows; when the
+    image slots are not supervised the split is by sample instead and is
+    reported as cos_edit (image samples) / cos_t2i (text-only samples)."""
+    keys = ("cos", "cos_vis", "cos_txt", "cos_edit", "cos_t2i", "roundtrip_cos")
+    tok_sum = {k: 0.0 for k in keys}
+    tok_n = {k: 0.0 for k in keys}
     err = ref = 0.0
     slice_cos = []
     n_samples = 0
@@ -146,25 +149,28 @@ def _eval_token_aligned(model, ck_model, val, dev):
         t = b["target"].to(dev).float()
         p = model(h, keep, vis).float()
         p_ck = ck_model(h, keep, vis).float()
-        m = keep.float()
+        sup = b["sup"].to(dev) if b.get("sup") is not None else keep
+        m = sup.float()
         cos = F.cosine_similarity(p, t, dim=-1)
         rt = F.cosine_similarity(p, p_ck, dim=-1)
-        is_vis = b["is_vis"].to(dev) & keep
-        is_txt = keep & ~is_vis
-        for key, sel in (("cos", keep), ("cos_vis", is_vis), ("cos_txt", is_txt)):
+        is_vis = b["is_vis"].to(dev) & sup
+        is_txt = sup & ~is_vis
+        has_img = torch.tensor([n > 0 for n in b["n_images"]], device=sup.device)[:, None]
+        for key, sel in (("cos", sup), ("cos_vis", is_vis), ("cos_txt", is_txt),
+                         ("cos_edit", sup & has_img), ("cos_t2i", sup & ~has_img)):
             tok_sum[key] += (cos * sel).sum().item()
             tok_n[key] += sel.sum().item()
         tok_sum["roundtrip_cos"] += (rt * keep).sum().item()
         tok_n["roundtrip_cos"] += keep.sum().item()
         err += (((p - t) ** 2) * m.unsqueeze(-1)).sum().item()
         ref += ((t ** 2) * m.unsqueeze(-1)).sum().item()
-        for j, ni in enumerate(b["n_images"]):
-            s0 = start_idx(ni)
+        for j, s0 in enumerate(b["sup_start"]):
             sl, ml = cos[j, s0:], m[j, s0:]
             slice_cos.append(((sl * ml).sum() / ml.sum().clamp_min(1.0)).item())
             n_samples += 1
         n_batches += 1
-    res = {k: tok_sum[k] / max(tok_n[k], 1.0) for k in tok_sum}
+    # a split with no rows (e.g. cos_vis when the slots are unsupervised) is absent, not 0
+    res = {k: tok_sum[k] / tok_n[k] for k in tok_sum if tok_n[k] > 0}
     res.update({"rel_mse": err / max(ref, 1e-8),
                 "cos_slice": sum(slice_cos) / max(1, len(slice_cos)),
                 "worst_sample_cos_slice": min(slice_cos) if slice_cos else float("nan"),

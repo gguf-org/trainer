@@ -105,7 +105,9 @@ def run_batch_ta(adapter, batch, device, cos_weight, inv_sigma):
     vis = batch["vis"].to(device).float() if batch.get("vis") is not None else None
     keep = batch["keep"].to(device)
     target = batch["target"].to(device).float()
-    mask = keep.float()
+    # the adapter attends over every real token (keep); the loss covers the
+    # rows the contract supervises (== keep for MageFlow)
+    mask = batch["sup"].to(device).float() if batch.get("sup") is not None else keep.float()
     if device.type == "cuda":
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             pred = adapter(hidden, keep, vis)
@@ -115,7 +117,11 @@ def run_batch_ta(adapter, batch, device, cos_weight, inv_sigma):
 
 
 @torch.no_grad()
-def validate_ta(adapter, val_set, device, cos_weight, inv_sigma):
+def validate_ta(adapter, val_set, device, cos_weight, inv_sigma, split_by_sample: bool = False):
+    """val_cos_vis / val_cos_txt carry the contract's two-way split
+    (VisionContract.val_split_labels): vision rows | text rows, or — when the
+    image slots are not supervised (split_by_sample) — the rows of image
+    samples | the rows of text-only samples."""
     adapter.eval()
     tot_mse = tot_cos = 0.0
     v_sum = v_n = t_sum = t_n = 0.0
@@ -124,8 +130,13 @@ def validate_ta(adapter, val_set, device, cos_weight, inv_sigma):
         tot_mse += rel_mse.item()
         tot_cos += cos.item()
         keep = batch["keep"].to(device)
-        is_vis = batch["is_vis"].to(device) & keep
-        is_txt = keep & ~is_vis
+        sup = batch["sup"].to(device) if batch.get("sup") is not None else keep
+        if split_by_sample:
+            has_img = torch.tensor([n > 0 for n in batch["n_images"]], device=device)[:, None]
+            is_vis, is_txt = sup & has_img, sup & ~has_img
+        else:
+            is_vis = batch["is_vis"].to(device) & sup
+            is_txt = sup & ~is_vis
         v_sum += (cos_tok * is_vis).sum().item()
         v_n += is_vis.sum().item()
         t_sum += (cos_tok * is_txt).sum().item()
@@ -256,7 +267,8 @@ def train(project, pack, log, report, should_stop) -> str:
             return loss, rel_mse, cos
 
         def validate_fn():
-            return validate_ta(adapter, val_set, device, cos_weight, inv_sigma_dev)
+            return validate_ta(adapter, val_set, device, cos_weight, inv_sigma_dev,
+                               split_by_sample=pack.contract(project).supervise != "all")
     elif seeded:
         def step_fn(batch):
             loss, rel_mse, cos, _ = run_batch_seeded(adapter, batch, device, cos_weight, inv_sigma_dev)

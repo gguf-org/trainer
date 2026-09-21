@@ -22,7 +22,7 @@ model's original text encoder in the **ggk** engine. Four trainer packs ship:
   original `trainer` recipe); the T5 *tokenizer* stays at inference, the
   encoder is never loaded.
 
-Both packs train against `pig_clip-f16.gguf` (get it [here](https://huggingface.co/gguf-org/trainer/blob/main/pig_clip-f16.gguf) or under **Relesases**) as the student.
+Both packs train against `pig_clip-f16.gguf` (get it [here](https://huggingface.co/gguf-org/trainer/blob/main/pig_clip-f16.gguf) or under **Relesases**) - the student.
 
 ```bash
 pip install gguf-trainer

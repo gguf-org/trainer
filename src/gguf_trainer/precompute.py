@@ -18,6 +18,11 @@ contract are discarded (with the checkpoints trained on them) and rebuilt.
     stat_s/stat_s2/stat_n over the rows the pack's VisionContract supervises
     (every real token for MageFlow).  t_sparse = 1: t_pack holds only the rows
     outside the image slots, [T - Tv, out_dim] (contracts whose DiT discards them)
+  ming_image packs ((image, prompt) jsonl corpus, at most one image per sample):
+    prompts [S]  n_images [S]  q_pack [T, in_dim]  len [S]  ids [T]        (student side, raw text)
+    seed_ids [P]  seed_len [S]  img_start [S]  t_dir [P, out_dim]           (one row per Ling prompt token)
+    t_cap [S*NQ, cap_dim]  v_pack [Tv, vis_dim]  vis_len [S]
+    stat_* caption moments, dstat_* direct-row moments
 """
 
 from __future__ import annotations
@@ -114,6 +119,49 @@ def auto_budgets_seeded(pc: dict, dev: torch.device) -> dict:
     return {k: (int(pc.get(k) or 0) or v) for k, v in defaults.items()}
 
 
+def ensure_seed_table(project, pack, teacher, seed_rank: int, log) -> torch.Tensor:
+    """ming_image: the frozen query seed table [vocab, seed_rank] = a centred PCA
+    of the teacher's token embedding table, scaled to unit RMS, kept in
+    <project>/seed_table.pt (deterministic; exported into the GGUF, so the
+    engine and the trainer share it bit-for-bit)."""
+    path = project.seed_table_path()
+    if path.is_file():
+        d = torch.load(path, map_location="cpu", weights_only=True)
+        w = d["table"]
+        if tuple(w.shape) != (pack.seed_vocab, seed_rank):
+            raise RuntimeError(f"{path} has shape {tuple(w.shape)}, expected {(pack.seed_vocab, seed_rank)}; "
+                               f"reset the project or restore train.seed_rank")
+        log(f"seed_table: loaded {path.name} (rank {seed_rank}, variance kept {d.get('variance_kept', float('nan')):.3f})")
+        return w
+    table = teacher.embed_table() if teacher is not None else None
+    if table is None:
+        log("seed_table: MOCK (teacher not on disk) — random table, never usable")
+        g = torch.Generator().manual_seed(11)
+        w = torch.randn(pack.seed_vocab, seed_rank, generator=g).to(torch.float16)
+        kept = float("nan")
+    else:
+        if table.shape[0] != pack.seed_vocab:
+            raise RuntimeError(f"teacher embedding table has {table.shape[0]} rows, the pack expects {pack.seed_vocab}")
+        log(f"seed_table: PCA of the {tuple(table.shape)} teacher embedding table -> rank {seed_rank} ...")
+        e = table.double()
+        mu = e.mean(0, keepdim=True)
+        e = e - mu
+        cov = e.T @ e / e.shape[0]
+        evals, evecs = torch.linalg.eigh(cov)
+        order = torch.argsort(evals, descending=True)[:seed_rank]
+        proj = evecs[:, order]                                    # [hidden, rank]
+        kept = float(evals[order].sum() / evals.sum().clamp_min(1e-12))
+        w = e @ proj
+        w = w / w.pow(2).mean().sqrt().clamp_min(1e-12)           # unit RMS overall
+        w = w.to(torch.float16)
+        log(f"seed_table: rank {seed_rank} keeps {kept:.3f} of the embedding variance")
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save({"table": w, "rank": seed_rank, "vocab": int(w.shape[0]), "variance_kept": kept, "pack": pack.id}, tmp)
+    replace_atomic(tmp, path)
+    log(f"seed_table: wrote {path}")
+    return w
+
+
 def ensure_vision_proj(project, pack, teacher, student_table: torch.Tensor, log) -> torch.Tensor:
     """The frozen vision_proj [in_dim, vis_dim] of a vision pack: fitted once
     per project from the teacher's and the student's embedding tables and
@@ -175,7 +223,7 @@ class PrecomputeContext:
         self.kind = pack.adapter_kind
         self.mock = use_mock_teacher()
         if self.mock:
-            self.teacher = pack.build_mock_teacher(log)
+            self.teacher = pack.build_mock_teacher(log, project=project)
         else:
             gpu_mem, cpu_mem = auto_mem_budgets(self.dev, float(pc.get("gpu_mem_gib", 0)),
                                                 float(pc.get("cpu_mem_gib", 0)))
@@ -194,6 +242,13 @@ class PrecomputeContext:
             self.s_embed = self.student.embed_tokens.weight.detach()
             w = ensure_vision_proj(project, pack, None if self.mock else self.teacher, self.s_embed.float().cpu(), log)
             self.w_vis = w.to(self.dev)
+            self.budgets = auto_budgets(pc, self.dev, float(getattr(pack, "budget_scale", 1.0)))
+            log(f"precompute budgets: {self.budgets}")
+            self.data_root = project.data_dir
+        if self.kind == "ming_image":
+            tc = project.config.get("train") or {}
+            ensure_seed_table(project, pack, None if self.mock else self.teacher,
+                              int(tc.get("seed_rank") or pack.seed_rank), log)
             self.budgets = auto_budgets(pc, self.dev, float(getattr(pack, "budget_scale", 1.0)))
             log(f"precompute budgets: {self.budgets}")
             self.data_root = project.data_dir
@@ -216,6 +271,8 @@ class PrecomputeContext:
         """-> True when every shard of the split exists, False when stopped."""
         if self.kind == "token_aligned_vision":
             return self._run_split_token_aligned(split, report, should_stop)
+        if self.kind == "ming_image":
+            return self._run_split_ming(split, report, should_stop)
         if self.kind == "seeded_resampler":
             return self._run_split_seeded(split, report, should_stop)
         return self._run_split_resampler(split, report, should_stop)
@@ -618,6 +675,198 @@ class PrecomputeContext:
             eta = left * size / rate if rate > 0 else None
             log(f"precompute[{split}] shard {si:05d}: {S} samples in {dt:.0f}s (vision {t_vis:.0f}s, teacher "
                 f"{t_teacher:.0f}s, {S / dt:.2f} s/s), {left} shards left (~{(eta or 0) / 3600:.1f} h)")
+            report({"done_shards": n_shards - left, "total_shards": n_shards, "shard_progress": 0.0,
+                    "prompts_per_s": rate, "eta_s": eta, "prompts": len(samples)})
+        log(f"precompute[{split}] done")
+        return True
+
+    # ------------------------------------------------------------ ming_image
+    def _run_split_ming(self, split: str, report, should_stop) -> bool:
+        """One image at most per sample (the Ming template shows the text
+        encoder one input image).  Student = pig_clip over the raw text; teacher
+        = caption rows + one direct row per Ling prompt token; vision embeds raw."""
+        from .ming_teacher import preprocess_vision_image
+
+        project, pack, log = self.project, self.pack, self.log
+        discard_stale_shards(project, split, log)
+        samples, size, out_dir, n_shards, todo = shard_plan(project, split)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_shard_contract(project, split)
+        log(f"precompute[{split}]: {len(samples)} samples, {n_shards} shards, {len(todo)} to do -> {out_dir}")
+        report({"done_shards": n_shards - len(todo), "total_shards": n_shards, "prompts": len(samples)})
+        if not todo:
+            return True
+        NQ, CAP_DIM, T_DIM, S_DIM, V_DIM = pack.num_queries, pack.cap_dim, pack.out_dim, pack.in_dim, pack.vis_dim
+        max_slots = int((project.config.get("train") or {}).get("max_slots") or pack.max_slots)
+        bud = self.budgets
+        dev = self.dev
+        rate_hist: List[float] = []
+        warned_multi = False
+
+        def batch_bounds(lens, cap_batch, cap_tokens):
+            bounds, b0 = [], 0
+            S = len(lens)
+            while b0 < S:
+                b = b0 + 1
+                while b < S and b - b0 < cap_batch:
+                    if (b - b0 + 1) * int(lens[b]) > cap_tokens:
+                        break
+                    b += 1
+                bounds.append((b0, b))
+                b0 = b
+            return bounds
+
+        for k, si in enumerate(todo):
+            if should_stop():
+                log(f"precompute[{split}]: stop requested before shard {si:05d}")
+                return False
+            t0 = time.time()
+            chunk = samples[si * size: (si + 1) * size]
+
+            # ---- pass 0: image preprocessing + both tokenizations ----
+            prepped = []
+            for s in chunk:
+                text = s.get("text", "") if isinstance(s, dict) else str(s)
+                rels = (s.get("images") or []) if isinstance(s, dict) else []
+                if len(rels) > 1 and not warned_multi:
+                    log("precompute: Ming-Image shows ONE input image to the text encoder; extra images are ignored")
+                    warned_multi = True
+                img, grid, n_img = None, None, 0
+                if rels:
+                    p = pathlib.Path(rels[0])
+                    if not p.is_absolute():
+                        p = self.data_root / rels[0]
+                    img, grid = preprocess_vision_image(p)
+                    n_img = grid[0] * grid[1]
+                ids, img_start = self.teacher.prompt_ids(text, n_img)
+                if len(ids) > max_slots:
+                    raise RuntimeError(f"prompt of {len(ids)} Ling tokens exceeds train.max_slots {max_slots} "
+                                       f"(lower corpus.max_chars or raise max_slots): {text[:60]!r}")
+                prepped.append({"ids": ids, "image_start": img_start, "grid": grid, "img": img, "n_img": n_img,
+                                "text": text, "n_imgs": 1 if rels else 0})
+            texts = [p["text"] for p in prepped]
+            ids_s, lens_s = tokenize_student(texts, self.tok, lambda t: t, pack.max_len_student)
+
+            # ---- pass 1: vision tower ----
+            tt = time.time()
+            queue = [(j, p["img"]) for j, p in enumerate(prepped) if p["img"] is not None]
+            b0 = 0
+            while b0 < len(queue):
+                if should_stop():
+                    log(f"precompute[{split}]: stop requested inside shard {si:05d} (shard discarded)")
+                    return False
+                b1, tokens = b0, 0
+                while b1 < len(queue):
+                    n = prepped[queue[b1][0]]["n_img"]
+                    if b1 > b0 and tokens + n > bud["vis_tok_budget"]:
+                        break
+                    tokens += n
+                    b1 += 1
+                outs = self.teacher.encode_images([im for _, im in queue[b0:b1]])
+                for o, (j, _) in zip(outs, queue[b0:b1]):
+                    assert o.shape[0] == prepped[j]["n_img"], (o.shape, prepped[j]["n_img"])
+                    prepped[j]["vis_embeds"] = o
+                b0 = b1
+            for p in prepped:
+                p["img"] = None
+                p.setdefault("vis_embeds", None)
+            t_vis = time.time() - tt
+
+            # ---- length-sorted storage (by Ling prompt length) ----
+            seed_len_all = np.array([len(p["ids"]) for p in prepped], dtype=np.int64)
+            order = np.argsort(seed_len_all, kind="stable")
+            S = len(prepped)
+            seed_len = seed_len_all[order]
+            seed_off = np.zeros(S + 1, dtype=np.int64)
+            np.cumsum(seed_len, out=seed_off[1:])
+            lens = lens_s[order]
+            off = np.zeros(S + 1, dtype=np.int64)
+            np.cumsum(lens, out=off[1:])
+            T = int(off[-1])
+            vis_len = np.array([prepped[r]["n_img"] for r in order], dtype=np.int64)
+            vis_off = np.zeros(S + 1, dtype=np.int64)
+            np.cumsum(vis_len, out=vis_off[1:])
+            t_cap = np.empty((S * NQ, CAP_DIM), dtype=np.int16)
+            t_dir = np.empty((int(seed_off[-1]), T_DIM), dtype=np.int16)
+            q_pack = np.empty((T, S_DIM), dtype=np.int16)
+            ids_pack = np.empty(T, dtype=np.int32)
+            seed_pack = np.empty(int(seed_off[-1]), dtype=np.int32)
+            v_pack = np.zeros((int(vis_off[-1]), V_DIM), dtype=np.int16)
+            for gi, r in enumerate(order):
+                p = prepped[r]
+                seed_pack[seed_off[gi]: seed_off[gi + 1]] = np.asarray(p["ids"], np.int32)
+                if p["vis_embeds"] is not None:
+                    v_pack[vis_off[gi]: vis_off[gi + 1]] = bf16_bits(p["vis_embeds"])
+            cs = np.zeros(CAP_DIM, dtype=np.float64)
+            cs2 = np.zeros(CAP_DIM, dtype=np.float64)
+            ds = np.zeros(T_DIM, dtype=np.float64)
+            ds2 = np.zeros(T_DIM, dtype=np.float64)
+
+            # ---- pass 2: teacher (token budget counts prompt + query rows) ----
+            tt = time.time()
+            for b0, b1 in batch_bounds(seed_len + NQ + 2, bud["teacher_batch"], bud["tok_budget"]):
+                if should_stop():
+                    log(f"precompute[{split}]: stop requested inside shard {si:05d} (shard discarded)")
+                    return False
+                rows = range(b0, b1)
+                cap, direct = self.teacher([{"ids": prepped[order[g]]["ids"], "image_start": prepped[order[g]]["image_start"],
+                                             "grid": prepped[order[g]]["grid"], "vis_embeds": prepped[order[g]]["vis_embeds"]}
+                                            for g in rows])
+                for j, gi in enumerate(rows):
+                    t_cap[gi * NQ: (gi + 1) * NQ] = bf16_bits(cap[j])
+                    n = int(seed_len[gi])
+                    assert direct[j].shape[0] == n, (direct[j].shape, n)
+                    t_dir[seed_off[gi]: seed_off[gi + 1]] = bf16_bits(direct[j])
+                    v = cap[j].double().numpy()
+                    cs += v.sum(0)
+                    cs2 += (v * v).sum(0)
+                    v = direct[j].double().numpy()
+                    ds += v.sum(0)
+                    ds2 += (v * v).sum(0)
+                report({"done_shards": n_shards - len(todo) + k, "total_shards": n_shards,
+                        "shard_progress": b1 / S, "prompts": len(samples)})
+            t_teacher = time.time() - tt
+
+            # ---- pass 3: student over the raw text ----
+            with torch.no_grad():
+                ids_sorted = ids_s[order]
+                for b0, b1 in batch_bounds(lens, bud["student_batch"], bud["student_tok_budget"]):
+                    rows = np.arange(b0, b1)
+                    Lq = int(lens[rows].max())
+                    ids = torch.from_numpy(ids_sorted[rows][:, :Lq].astype(np.int64)).to(dev)
+                    mask = (torch.arange(Lq, device=dev)[None, :] < torch.from_numpy(lens[rows]).to(dev)[:, None]).long()
+                    h = self.student(input_ids=ids, attention_mask=mask).last_hidden_state.to(torch.bfloat16).cpu()
+                    for j, gi in enumerate(rows):
+                        li = int(lens[gi])
+                        q_pack[off[gi]: off[gi + 1]] = bf16_bits(h[j, :li])
+                        ids_pack[off[gi]: off[gi + 1]] = ids_sorted[gi, :li]
+
+            path = out_dir / f"{split}-{si:05d}.npz"
+            tmp = out_dir / f"{split}-{si:05d}.tmp.npz"
+            np.savez(tmp, prompts=np.array([prepped[r]["text"] for r in order]),
+                     n_images=np.array([prepped[r]["n_imgs"] for r in order], dtype=np.int32),
+                     q_pack=q_pack, len=lens.astype(np.int32), ids=ids_pack,
+                     seed_ids=seed_pack, seed_len=seed_len.astype(np.int32),
+                     img_start=np.array([prepped[r]["image_start"] for r in order], dtype=np.int32),
+                     t_cap=t_cap, t_dir=t_dir, v_pack=v_pack, vis_len=vis_len.astype(np.int32),
+                     stat_s=cs, stat_s2=cs2, stat_n=np.array([S * NQ]),
+                     dstat_s=ds, dstat_s2=ds2, dstat_n=np.array([int(seed_off[-1])]),
+                     num_queries=np.array([NQ]),
+                     meta=np.array([json.dumps({"pack": pack.id, "student": self.student_name,
+                                                "contract": project.shard_contract(), "mock_teacher": self.mock,
+                                                "teacher_mode": getattr(self.teacher, "mode", "?"),
+                                                "storage": "bf16_bits", "shard": si, "time": time.time()})]))
+            with open(tmp, "rb+") as f:
+                os.fsync(f.fileno())
+            replace_atomic(tmp, path)
+            dt = time.time() - t0
+            rate_hist.append(S / dt)
+            rate = sum(rate_hist[-5:]) / len(rate_hist[-5:])
+            left = len(todo) - k - 1
+            eta = left * size / rate if rate > 0 else None
+            log(f"precompute[{split}] shard {si:05d}: {S} samples in {dt:.0f}s (vision {t_vis:.0f}s, teacher "
+                f"{t_teacher:.0f}s, {S / dt:.2f} s/s, {seed_off[-1] / S:.0f} Ling tokens/sample), {left} shards left "
+                f"(~{(eta or 0) / 3600:.1f} h)")
             report({"done_shards": n_shards - left, "total_shards": n_shards, "shard_progress": 0.0,
                     "prompts_per_s": rate, "eta_s": eta, "prompts": len(samples)})
         log(f"precompute[{split}] done")

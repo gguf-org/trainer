@@ -17,6 +17,12 @@ seeded resampler packs (PixArt T5):
   rel_mse       relative MSE over the real slots
   worst_row_cos the worst real slot in the val set
 
+ming_image packs:
+  cos_centered      mean of the two heads' centred cosines (judge this)
+  cos_centered_cap  the 256 caption rows / cos_centered_dir the real Ling slots
+  cos_rms           per-row RMSNorm cosine (== what the DiT consumes), both heads
+  rel_mse           relative MSE over both heads
+
 token-aligned vision packs:
   cos           per-token cosine over every real token
   cos_vis / cos_txt   split by vision vs text positions
@@ -34,7 +40,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .adapter import KIND_SEEDED, KIND_TOKEN_VISION
+from .adapter import KIND_MING, KIND_SEEDED, KIND_TOKEN_VISION
 from .devices import pick_device
 from .export import checkpoint_file, gguf_adapter_model, load_folded_model
 from .shards import ValSet
@@ -62,6 +68,8 @@ def evaluate(project, pack, log, gguf_path: Optional[pathlib.Path] = None, check
         res = _eval_token_aligned(model, ck_model, val, dev)
     elif cfg.kind == KIND_SEEDED:
         res = _eval_seeded(model, ck_model, val, dev)
+    elif cfg.kind == KIND_MING:
+        res = _eval_ming(model, ck_model, val, dev, ck["mu"].to(dev), ck["mu2"].to(dev))
     else:
         res = _eval_resampler(model, ck_model, val, dev, ck["mu"].to(dev))
     res.update({"gguf": str(gguf_path), "kind": cfg.kind, "trained_steps": int(kv.get("adapter.trained_steps", 0)),
@@ -92,6 +100,50 @@ def _eval_resampler(model, ck_model, val, dev, mu):
         n += 1
     res = {k: v / max(1, n) for k, v in sums.items()}
     res.update({"worst_row_cos_rms": worst_rms, "val_batches": n})
+    return res
+
+
+def _eval_ming(model, ck_model, val, dev, mu_cap, mu_dir):
+    sums = {"cos_centered_cap": 0.0, "cos_centered_dir": 0.0, "cos_rms_cap": 0.0, "cos_rms_dir": 0.0,
+            "cos_raw_cap": 0.0, "cos_raw_dir": 0.0, "roundtrip_cos": 0.0}
+    err = ref = 0.0
+    worst_rms = 1.0
+    n = 0
+    for b in val:
+        h = b["qwen_hidden"].to(dev).float()
+        keep = b["keep"].to(dev)
+        seed_ids = b["seed_ids"].to(dev)
+        slot_mask = b["slot_mask"].to(dev)
+        vis = b["vis"].to(dev).float() if b.get("vis") is not None else None
+        vis_keep = b["vis_keep"].to(dev) if vis is not None else None
+        svi = b["slot_vis_index"].to(dev) if vis is not None else None
+        t_cap = b["target_cap"].to(dev).float()
+        t_dir = b["target_dir"].to(dev).float()
+        p_cap, p_dir = model(h, keep, seed_ids, slot_mask, vis, vis_keep, svi)
+        q_cap, q_dir = ck_model(h, keep, seed_ids, slot_mask, vis, vis_keep, svi)
+        p_cap, p_dir, q_cap, q_dir = p_cap.float(), p_dir.float(), q_cap.float(), q_dir.float()
+        m = slot_mask.float()
+        nm = m.sum().clamp_min(1.0)
+        sums["cos_centered_cap"] += F.cosine_similarity(p_cap - mu_cap, t_cap - mu_cap, dim=-1).mean().item()
+        sums["cos_centered_dir"] += ((F.cosine_similarity(p_dir - mu_dir, t_dir - mu_dir, dim=-1) * m).sum() / nm).item()
+        c_rms = F.cosine_similarity(rms_norm(p_cap), rms_norm(t_cap), dim=-1)
+        sums["cos_rms_cap"] += c_rms.mean().item()
+        worst_rms = min(worst_rms, c_rms.min().item())
+        d_rms = F.cosine_similarity(rms_norm(p_dir), rms_norm(t_dir), dim=-1)
+        sums["cos_rms_dir"] += ((d_rms * m).sum() / nm).item()
+        worst_rms = min(worst_rms, d_rms[slot_mask].min().item())
+        sums["cos_raw_cap"] += F.cosine_similarity(p_cap, t_cap, dim=-1).mean().item()
+        sums["cos_raw_dir"] += ((F.cosine_similarity(p_dir, t_dir, dim=-1) * m).sum() / nm).item()
+        rt_c = F.cosine_similarity(p_cap - mu_cap, q_cap - mu_cap, dim=-1).mean()
+        rt_d = (F.cosine_similarity(p_dir - mu_dir, q_dir - mu_dir, dim=-1) * m).sum() / nm
+        sums["roundtrip_cos"] += (0.5 * (rt_c + rt_d)).item()
+        err += ((p_cap - t_cap) ** 2).sum().item() + (((p_dir - t_dir) ** 2) * m.unsqueeze(-1)).sum().item()
+        ref += (t_cap ** 2).sum().item() + ((t_dir ** 2) * m.unsqueeze(-1)).sum().item()
+        n += 1
+    res = {k: v / max(1, n) for k, v in sums.items()}
+    res.update({"cos_centered": 0.5 * (res["cos_centered_cap"] + res["cos_centered_dir"]),
+                "cos_rms": 0.5 * (res["cos_rms_cap"] + res["cos_rms_dir"]),
+                "rel_mse": err / max(ref, 1e-8), "worst_row_cos_rms": worst_rms, "val_batches": n})
     return res
 
 

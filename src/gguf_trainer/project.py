@@ -20,6 +20,7 @@ Resume button) picks up exactly where the pipeline stopped.
                       output folder, so projects sharing one output folder
                       never overwrite each other's)
     vision_proj.pt    vision packs: the frozen mmproj -> student map
+    seed_table.pt     ming_image pack: the frozen PCA of the Ling embedding table
     ../               exported .gguf files land NEXT TO the project folder by
                       default (export.output_dir overrides), e.g.
                       test-trainer/pig_llada_adapter-f16.gguf next to
@@ -110,7 +111,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "export": {
         "output_dir": "",       # default: the folder containing the project folder
         "copy_to": "",          # optional extra destination directory
-        "export_sigvq": True,
+        "export_sigvq": True,       # llada_image: the SigVQ encoder -> <name>_sigvq-f16.gguf
+        "export_vision": True,      # ming_image: the Qwen2.5-VL tower -> <name>_vision-<vision_quant>.gguf
+        "vision_quant": "f16",      # ming_image: f16 | q8_0
         "run_eval": True,
     },
 }
@@ -238,6 +241,9 @@ class Project:
 
     def vision_proj_path(self) -> pathlib.Path:
         return self.path / "vision_proj.pt"
+
+    def seed_table_path(self) -> pathlib.Path:
+        return self.path / "seed_table.pt"
 
     def create(self, name: str, pack: str) -> None:
         from .packs import get_pack

@@ -9,6 +9,12 @@ stream position is part of the checkpoint, so a resume replays exactly).
   token-aligned:  t_pack [T, out_dim] one row per real token, packed like
                   q_pack; v_pack [Tv, vis_dim] raw vision embeds + a
                   (vis_sample, vis_start, vis_len) segment table; n_images
+  ming_image:     t_cap [S*NQ, cap_dim] caption rows; seed_ids [P] the Ling
+                  prompt ids packed in sample order with seed_len [S], t_dir
+                  [P, out_dim] one direct row per Ling token; img_start [S]
+                  (slot of the first <imagePatch>, -1 without an image),
+                  v_pack [Tv, vis_dim] + vis_len [S] (one image per sample);
+                  stat_* = caption moments, dstat_* = direct-row moments
 """
 
 from __future__ import annotations
@@ -27,14 +33,16 @@ def shard_files(dir_):
     return [os.path.join(dir_, f) for f in fs]
 
 
-def load_stats(dir_, sigma_floor):
+def load_stats(dir_, sigma_floor, prefix="stat"):
+    """Per-dim (mu, sigma, 1/sigma_floored, n_floored) of the target rows from the
+    shards' running moments; prefix "dstat" = the ming_image direct rows."""
     s = s2 = None
     n = 0.0
     for f in shard_files(dir_):
         z = np.load(f, allow_pickle=False)
-        s = z["stat_s"] if s is None else s + z["stat_s"]
-        s2 = z["stat_s2"] if s2 is None else s2 + z["stat_s2"]
-        n += float(z["stat_n"][0])
+        s = z[prefix + "_s"] if s is None else s + z[prefix + "_s"]
+        s2 = z[prefix + "_s2"] if s2 is None else s2 + z[prefix + "_s2"]
+        n += float(z[prefix + "_n"][0])
     mu = s / n
     var = np.maximum(s2 / n - mu * mu, 1e-6)
     sigma = np.sqrt(var)
@@ -52,15 +60,28 @@ class Shard:
     def __init__(self, path):
         z = np.load(path, allow_pickle=False)
         self.prompts = z["prompts"]
-        self.t_pack = z["t_pack"]
+        self.t_pack = z["t_pack"] if "t_pack" in z else None      # ming_image shards carry t_cap / t_dir instead
         self.q_pack = z["q_pack"]
         self.len = z["len"].astype(np.int64)
         self.ids = z["ids"]
         self.num_queries = int(z["num_queries"][0]) if "num_queries" in z else 256
         self.off = np.concatenate([[0], np.cumsum(self.len)])
         self.n = len(self.len)
-        self.token_aligned = self.num_queries == 0
-        self.seeded = "seed_ids" in z
+        self.ming = "t_cap" in z
+        self.token_aligned = self.num_queries == 0 and not self.ming
+        self.seeded = "seed_ids" in z and not self.ming
+        if self.ming:
+            self.t_cap = z["t_cap"]
+            self.t_dir = z["t_dir"]
+            self.seed_ids = z["seed_ids"].astype(np.int64)
+            self.seed_len = z["seed_len"].astype(np.int64)
+            self.seed_off = np.concatenate([[0], np.cumsum(self.seed_len)])
+            self.img_start = z["img_start"].astype(np.int64)
+            self.n_images = z["n_images"].astype(np.int64)
+            self.vis_len = z["vis_len"].astype(np.int64)
+            self.vis_off = np.concatenate([[0], np.cumsum(self.vis_len)])
+            self.v_pack = z["v_pack"]
+            self.vis_dim = int(self.v_pack.shape[1]) if self.v_pack.ndim == 2 else 0
         if self.seeded:
             self.seed_ids = z["seed_ids"].astype(np.int64)
             self.seed_len = z["seed_len"].astype(np.int64)
@@ -95,6 +116,8 @@ class Shard:
         L = int(self.len[rows].max())
         hidden = np.zeros((B, L, self.q_pack.shape[1]), dtype=np.int16)
         keep = np.zeros((B, L), dtype=bool)
+        if self.ming:
+            return self._batch_ming(rows, hidden, keep)
         if self.seeded:
             NQ = self.num_queries
             target = np.zeros((B, NQ, self.t_pack.shape[1]), dtype=np.int16)
@@ -159,6 +182,53 @@ class Shard:
             "keep": torch.from_numpy(keep),
             "sup": torch.from_numpy(sup),
             "sup_start": [int(self.sup_start[r]) for r in rows],
+        }
+
+
+    def _batch_ming(self, rows, hidden, keep):
+        B, L = hidden.shape[0], hidden.shape[1]
+        NQ = self.num_queries
+        P = int(self.seed_len[rows].max())
+        V = int(self.vis_len[rows].max())
+        target_cap = np.empty((B, NQ, self.t_cap.shape[1]), dtype=np.int16)
+        target_dir = np.zeros((B, P, self.t_dir.shape[1]), dtype=np.int16)
+        seed_ids = np.zeros((B, P), dtype=np.int64)
+        slot_mask = np.zeros((B, P), dtype=bool)
+        vis = np.zeros((B, V, self.vis_dim), dtype=np.int16) if V > 0 else None
+        vis_keep = np.zeros((B, V), dtype=bool)
+        slot_vis_index = np.full((B, P), V, dtype=np.int64)          # row V = the zero row
+        is_img_slot = np.zeros((B, P), dtype=bool)
+        for j, r in enumerate(rows):
+            li = int(self.len[r])
+            hidden[j, :li] = self.q_pack[self.off[r]: self.off[r + 1]]
+            keep[j, :li] = True
+            target_cap[j] = self.t_cap[r * NQ: (r + 1) * NQ]
+            n = int(self.seed_len[r])
+            target_dir[j, :n] = self.t_dir[self.seed_off[r]: self.seed_off[r + 1]]
+            seed_ids[j, :n] = self.seed_ids[self.seed_off[r]: self.seed_off[r + 1]]
+            slot_mask[j, :n] = True
+            nv = int(self.vis_len[r])
+            if nv > 0:
+                vis[j, :nv] = self.v_pack[self.vis_off[r]: self.vis_off[r + 1]]
+                vis_keep[j, :nv] = True
+                st = int(self.img_start[r])
+                slot_vis_index[j, st: st + nv] = np.arange(nv)
+                is_img_slot[j, st: st + nv] = True
+        tc = from_bits(target_cap)
+        return {
+            "prompts": [str(self.prompts[r]) for r in rows],
+            "n_images": [int(self.n_images[r]) for r in rows],
+            "target": tc,                       # the caption rows (the loop counts prompts on it)
+            "target_cap": tc,
+            "target_dir": from_bits(target_dir),
+            "qwen_hidden": from_bits(hidden),
+            "keep": torch.from_numpy(keep),
+            "seed_ids": torch.from_numpy(seed_ids),
+            "slot_mask": torch.from_numpy(slot_mask),
+            "is_img_slot": torch.from_numpy(is_img_slot),
+            "vis": from_bits(vis) if vis is not None else None,
+            "vis_keep": torch.from_numpy(vis_keep),
+            "slot_vis_index": torch.from_numpy(slot_vis_index),
         }
 
 

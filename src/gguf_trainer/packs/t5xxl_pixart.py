@@ -110,7 +110,7 @@ class T5XXLPixArtPack(TrainerPack):
         return T5Teacher(self.teacher_dir(project), device, gpu_gib, self.num_queries,
                          pc.get("teacher_mode", "auto"), log)
 
-    def build_mock_teacher(self, log):
+    def build_mock_teacher(self, log, project=None):
         from ..t5_teacher import MockT5Teacher
 
         return MockT5Teacher(self.out_dim, self.num_queries, self.seed_vocab, log)

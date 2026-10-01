@@ -93,7 +93,7 @@ class LLaDAImagePack(TrainerPack):
         return LLaDATeacher(self.teacher_dir(project), device, gpu_mem, cpu_mem, self.format_prompt,
                             max_len=self.max_len_teacher, log=log, placement=placement)
 
-    def build_mock_teacher(self, log):
+    def build_mock_teacher(self, log, project=None):
         from ..llada_teacher import MockTeacher
 
         return MockTeacher(self.num_queries, self.out_dim, self.format_prompt, log)

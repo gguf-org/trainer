@@ -282,6 +282,9 @@ function renderDerived() {
   $('precompute-placement-field').style.display = control === 'placement' ? '' : 'none';
   $('precompute-teacher-mode-field').style.display = control === 'teacher_mode' ? '' : 'none';
   $('export-sigvq-row').style.display = pk.id === 'llada_image' ? '' : 'none';
+  $('export-vision-row').style.display = pk.id === 'ming_image' ? '' : 'none';
+  const exportBase = config.name.endsWith('_adapter') ? config.name.slice(0, -'_adapter'.length) : config.name;
+  $('export-vision-name').textContent = `${exportBase}_vision-${(config.export && config.export.vision_quant) || 'f16'}.gguf`;
   $('corpus-badge').textContent = images ? 'images + instructions' : 'text prompts';
   $('train-summary').textContent = `width ${config.train.width} · depth ${config.train.depth} · ${config.train.steps} steps · batch ${config.train.batch_size}`;
   $('precompute-summary').textContent = `shards ${config.precompute.shard_size} · teacher batch ${config.precompute.teacher_batch || 'auto'} · ${config.precompute.device}`;

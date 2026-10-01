@@ -234,6 +234,7 @@
           <div class="path-box"><span class="path-text placeholder" data-cfg-path="export.copy_to" data-kind="dir">Optional: your ggk model folder</span><button class="clear-btn" data-clear="export.copy_to">✕</button></div>
           <button class="btn browse-btn" data-for="export.copy_to" data-kind="dir">Browse</button></div>
         <label class="toggle-row" id="export-sigvq-row"><input type="checkbox" data-cfg="export.export_sigvq"> Also export the paired vision encoder GGUF (SigVQ, for <code>--llm_vision</code>) when downloaded</label>
+        <label class="toggle-row" id="export-vision-row"><input type="checkbox" data-cfg="export.export_vision"> <span>Also export the paired vision encoder GGUF (Qwen2.5-VL tower, for <code>--llm_vision</code>) in f16 → <code id="export-vision-name">pig_ming_vision-f16.gguf</code></span></label>
         <label class="toggle-row"><input type="checkbox" data-cfg="export.run_eval"> Evaluate the exported GGUF on the val shards</label>
         <label class="toggle-row"><input type="checkbox" data-cfg="auto_resume"> Resume automatically when <code>gguf-trainer --auto-resume</code> launches after a reboot</label>
       </section>

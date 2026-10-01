@@ -17,6 +17,13 @@ on RAW targets, the mask being the teacher window's real slots (pads are
 never supervised — the DiT never attends there), the queries seeded with
 the teacher token ids of the batch.
 
+ming_image packs: two heads, each on its own STANDARDIZED target (the
+caption rows carry the connector's per-dim offset, the direct rows the
+proj_directvlm bias): the resampler loss over the 256 caption rows plus the
+same loss masked to the real Ling slots over the direct rows; export.py
+folds both (mu, sigma) pairs into out_cap / out_proj.  Readouts: the mean of
+the two cosines, split as caption | direct.
+
 Stop-at-any-time: the STOP file or SIGINT/SIGTERM saves last.pt atomically
 after the current step; the next run resumes step, optimizer, best-val
 tracking and the exact stream position.
@@ -39,7 +46,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .adapter import KIND_RESAMPLER, KIND_SEEDED, KIND_TOKEN_VISION, AdapterConfig, adapter_config_for, build_adapter
+from .adapter import KIND_MING, KIND_RESAMPLER, KIND_SEEDED, KIND_TOKEN_VISION, AdapterConfig, adapter_config_for, build_adapter
 from .devices import device_index, pick_device
 from .shards import ShardStream, ValSet, load_stats
 from .util import replace_atomic, write_json_atomic
@@ -176,6 +183,62 @@ def validate_seeded(adapter, val_set, device, cos_weight, inv_sigma):
     return {"val_rel_mse": tot_mse / n, "val_cos": tot_cos / n}
 
 
+# ---------------------------------------------------------------- ming_image (caption + direct heads)
+
+def masked_std_loss(pred_std, target, mask, cos_weight, mu, sigma):
+    """Standardized-target loss over the rows `mask` selects ([B, P] bool)."""
+    pred_std = pred_std.float()
+    target = target.float()
+    m = mask.float().unsqueeze(-1)
+    n = m.sum().clamp_min(1.0)
+    target_std = (target - mu) / sigma
+    mse = (((pred_std - target_std) ** 2) * m).sum() / (n * pred_std.shape[-1])
+    cos_row = F.cosine_similarity(pred_std, target_std, dim=-1)
+    cos = (cos_row * mask.float()).sum() / n
+    pred_raw = pred_std * sigma + mu
+    rel_mse = (((pred_raw - target) ** 2) * m).sum() / ((target ** 2) * m).sum().clamp_min(1e-8)
+    return mse + cos_weight * (1.0 - cos), rel_mse.detach(), cos.detach()
+
+
+def run_batch_ming(adapter, batch, device, cos_weight, stats_cap, stats_dir):
+    mu_c, sig_c = stats_cap
+    mu_d, sig_d = stats_dir
+    hidden = batch["qwen_hidden"].to(device).float()
+    keep = batch["keep"].to(device)
+    seed_ids = batch["seed_ids"].to(device)
+    slot_mask = batch["slot_mask"].to(device)
+    vis = batch["vis"].to(device).float() if batch.get("vis") is not None else None
+    vis_keep = batch["vis_keep"].to(device) if vis is not None else None
+    svi = batch["slot_vis_index"].to(device) if vis is not None else None
+    t_cap = batch["target_cap"].to(device).float()
+    t_dir = batch["target_dir"].to(device).float()
+    if device.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            p_cap, p_dir = adapter(hidden, keep, seed_ids, slot_mask, vis, vis_keep, svi)
+    else:
+        p_cap, p_dir = adapter(hidden, keep, seed_ids, slot_mask, vis, vis_keep, svi)
+    loss_c, rel_c, cos_c = loss_fn(p_cap, t_cap, cos_weight, mu_c, sig_c)
+    loss_d, rel_d, cos_d = masked_std_loss(p_dir, t_dir, slot_mask, cos_weight, mu_d, sig_d)
+    return loss_c + loss_d, 0.5 * (rel_c + rel_d), 0.5 * (cos_c + cos_d), cos_c, cos_d
+
+
+@torch.no_grad()
+def validate_ming(adapter, val_set, device, cos_weight, stats_cap, stats_dir):
+    """val_cos_vis / val_cos_txt carry the (caption, direct) split (the pack's
+    val_split_labels)."""
+    adapter.eval()
+    tot_mse = tot_cos = tot_c = tot_d = 0.0
+    for batch in val_set:
+        _, rel_mse, cos, cos_c, cos_d = run_batch_ming(adapter, batch, device, cos_weight, stats_cap, stats_dir)
+        tot_mse += rel_mse.item()
+        tot_cos += cos.item()
+        tot_c += cos_c.item()
+        tot_d += cos_d.item()
+    adapter.train()
+    n = max(1, len(val_set))
+    return {"val_rel_mse": tot_mse / n, "val_cos": tot_cos / n, "val_cos_vis": tot_c / n, "val_cos_txt": tot_d / n}
+
+
 # ---------------------------------------------------------------- loop
 
 def train(project, pack, log, report, should_stop) -> str:
@@ -196,21 +259,34 @@ def train(project, pack, log, report, should_stop) -> str:
     log_every, val_every, save_every = int(tc["log_every"]), int(tc["val_every"]), int(tc["save_every"])
     token_aligned = pack.adapter_kind == KIND_TOKEN_VISION
     seeded = pack.adapter_kind == KIND_SEEDED
-    standardized = pack.adapter_kind == KIND_RESAMPLER      # the others train on raw targets
+    ming = pack.adapter_kind == KIND_MING
+    standardized = pack.adapter_kind in (KIND_RESAMPLER, KIND_MING)      # the others train on raw targets
 
     mu, sigma, inv_sigma, floored = load_stats(train_dir, sigma_floor)
     log(f"target sigma: min {sigma.min():.3f} med {sigma.median():.3f} max {sigma.max():.3f}; {floored} dims floored")
     sigma_f = torch.maximum(sigma, torch.tensor(sigma_floor))
     stats = (mu.to(device), sigma_f.to(device))
     inv_sigma_dev = inv_sigma.to(device)
+    mu2 = sigma2_f = None
+    stats_dir = None
+    if ming:
+        mu2, sigma2, _, floored2 = load_stats(train_dir, sigma_floor, prefix="dstat")
+        log(f"direct-row sigma: min {sigma2.min():.3f} med {sigma2.median():.3f} max {sigma2.max():.3f}; {floored2} dims floored")
+        sigma2_f = torch.maximum(sigma2, torch.tensor(sigma_floor))
+        stats_dir = (mu2.to(device), sigma2_f.to(device))
 
-    cfg = adapter_config_for(pack, int(tc["width"]), int(tc["depth"]))
+    cfg = adapter_config_for(pack, int(tc["width"]), int(tc["depth"]), tc)
     adapter = build_adapter(cfg)
     if token_aligned:
         vp = project.vision_proj_path()
         if not vp.is_file():
             raise RuntimeError(f"{vp} missing: run the precompute stage first (it fits the frozen vision_proj)")
         adapter.set_vision_proj(torch.load(vp, map_location="cpu", weights_only=True)["weight"])
+    if ming:
+        sp = project.seed_table_path()
+        if not sp.is_file():
+            raise RuntimeError(f"{sp} missing: run the precompute stage first (it builds the frozen seed table)")
+        adapter.set_seed_table(torch.load(sp, map_location="cpu", weights_only=True)["table"])
     adapter.to(device)
     gc = tc.get("grad_checkpoint", "auto")
     if gc == "auto":
@@ -276,6 +352,13 @@ def train(project, pack, log, report, should_stop) -> str:
 
         def validate_fn():
             return validate_seeded(adapter, val_set, device, cos_weight, inv_sigma_dev)
+    elif ming:
+        def step_fn(batch):
+            loss, rel_mse, cos, _, _ = run_batch_ming(adapter, batch, device, cos_weight, stats, stats_dir)
+            return loss, rel_mse, cos
+
+        def validate_fn():
+            return validate_ming(adapter, val_set, device, cos_weight, stats, stats_dir)
     else:
         def step_fn(batch):
             return run_batch(adapter, batch, device, cos_weight, stats)
@@ -300,7 +383,8 @@ def train(project, pack, log, report, should_stop) -> str:
         torch.save({"config": cfg.to_dict(), "model": adapter.state_dict(), "opt": opt.state_dict(),
                     "step": step, "train_config": dict(tc), "best_val_cos": best_val_cos,
                     "stream_state": stream.state(), "torch_rng": torch.get_rng_state(),
-                    "mu": mu, "sigma": sigma_f, "standardized": standardized, "pack": pack.id,
+                    "mu": mu, "sigma": sigma_f, "mu2": mu2, "sigma2": sigma2_f,
+                    "standardized": standardized, "pack": pack.id,
                     "val": dict(val) if val_step == step else None}, tmp)
         with open(tmp, "rb+") as f:
             os.fsync(f.fileno())

@@ -12,6 +12,7 @@ import json
 import mimetypes
 import os
 import pathlib
+import re
 import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -111,6 +112,11 @@ def _project_payload(p: Project, online: bool = True) -> Dict[str, Any]:
     for f in d["output_files"]:
         if f["name"].endswith("_sigvq-f16.gguf"):
             extras["sigvq"] = f["path"]
+        elif re.search(r"_vision-(f16|q8_0)\.gguf$", f["name"]):
+            # prefer the quant the project exports (f16 by default) when both files exist
+            want = str((p.config.get("export") or {}).get("vision_quant") or "f16").lower()
+            if "vision" not in extras or f["name"].endswith(f"_vision-{want}.gguf"):
+                extras["vision"] = f["name"]
     student = next((m["path"] for m in d["materials"] if m["id"] == "student"), "<pig_clip.gguf>")
     d["engine_command"] = pack.engine_command(pathlib.Path(student).name if student else "<pig_clip.gguf>",
                                               str(p.adapter_path()), {k: v for k, v in extras.items()})

@@ -136,7 +136,7 @@ class Qwen3VLQwenImagePack(TrainerPack):
         gpu_gib = float(str(gpu_mem).replace("GiB", "")) if isinstance(gpu_mem, str) else float(gpu_mem or 0)
         return Qwen3VLFullTeacher(self.teacher_dir(project), device, gpu_gib, pc.get("teacher_mode", "auto"), log)
 
-    def build_mock_teacher(self, log):
+    def build_mock_teacher(self, log, project=None):
         from ..qwen3vl_teacher import MockVisionTeacher
 
         return MockVisionTeacher(self.out_dim, self.vis_dim, log)

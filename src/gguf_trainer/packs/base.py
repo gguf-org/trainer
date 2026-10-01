@@ -22,7 +22,7 @@ import dataclasses
 import pathlib
 from typing import Any, Dict, List, Optional
 
-ADAPTER_KINDS = ("resampler", "seeded_resampler", "token_aligned_vision")
+ADAPTER_KINDS = ("resampler", "seeded_resampler", "token_aligned_vision", "ming_image")
 
 
 @dataclasses.dataclass
@@ -146,11 +146,16 @@ class TrainerPack:
         token_aligned_vision: an object with .encode_images() / .hidden() (see qwen3vl_teacher.py)"""
         raise NotImplementedError
 
-    def build_mock_teacher(self, log):
+    def build_mock_teacher(self, log, project=None):
         raise NotImplementedError
 
     def export_kv(self, project) -> Dict[str, Any]:
         """Extra GGUF key/values describing the target."""
+        return {}
+
+    def export_extra_tensors(self, project, log) -> Dict[str, Any]:
+        """Extra tensors written into the adapter GGUF WITHOUT the adapter.
+        prefix (name -> numpy array), e.g. a teacher tokenizer the engine needs."""
         return {}
 
     def extra_exports(self, project, log) -> List[pathlib.Path]:

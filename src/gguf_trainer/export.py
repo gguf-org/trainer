@@ -7,7 +7,12 @@ seed = the teacher tokenizer's ids); `adapter.vision_proj.weight` selects
 the vision extension; head_dim 64).  Norms, biases, the query and vision_proj stay
 f32, other 2-D weights go f16.  A resampler trained on standardized targets
 has the standardization folded into out_proj so the engine emits
-teacher-scale rows:  W' = diag(sigma) W,  b' = sigma * b + mu.
+teacher-scale rows:  W' = diag(sigma) W,  b' = sigma * b + mu.  The
+ming_image adapter (`adapter.cap_query` selects it) folds its two heads
+(out_cap <- mu/sigma of the caption rows, out_proj <- those of the direct
+rows) and carries the Ling tokenizer.json as `tokenizer_json` (F16 bytes,
+the layout the Ming-Image text encoder GGUF uses) so the engine can build
+the seed ids without the 16B encoder.
 
 The same writer serves the end-of-run export (best.pt -> <name>-f16.gguf)
 and the mid-run snapshots (best.pt or last.pt -> <name>-step<N>-f16.gguf,
@@ -28,7 +33,7 @@ import torch
 from gguf_connector.reader import GGUFReader
 from gguf_connector.writer import GGUFWriter
 
-from .adapter import KIND_RESAMPLER, KIND_SEEDED, KIND_TOKEN_VISION, AdapterConfig, build_adapter
+from .adapter import KIND_MING, KIND_RESAMPLER, KIND_SEEDED, KIND_TOKEN_VISION, AdapterConfig, build_adapter
 from .util import replace_atomic
 
 
@@ -42,13 +47,21 @@ def load_folded_model(checkpoint: pathlib.Path):
         mu = ck["mu"].float()
         sigma = ck["sigma"].float()
         with torch.no_grad():
-            model.out_proj.weight.mul_(sigma[:, None])
-            model.out_proj.bias.mul_(sigma).add_(mu)
+            if cfg.kind == KIND_MING:
+                model.out_cap.weight.mul_(sigma[:, None])
+                model.out_cap.bias.mul_(sigma).add_(mu)
+                mu2, sigma2 = ck["mu2"].float(), ck["sigma2"].float()
+                model.out_proj.weight.mul_(sigma2[:, None])
+                model.out_proj.bias.mul_(sigma2).add_(mu2)
+            else:
+                model.out_proj.weight.mul_(sigma[:, None])
+                model.out_proj.bias.mul_(sigma).add_(mu)
     return model, cfg, ck
 
 
 def _keep_f32(name: str, a: np.ndarray) -> bool:
-    return a.ndim == 1 or name in ("query", "vision_proj.weight") or ".ln_" in name or name.startswith("ln_")
+    return (a.ndim == 1 or name in ("query", "vision_proj.weight", "cap_query", "slot_query")
+            or ".ln_" in name or name.startswith("ln_"))
 
 
 def checkpoint_file(project, checkpoint: str) -> pathlib.Path:
@@ -88,6 +101,14 @@ def export_adapter(project, pack, log, checkpoint: str = "best", out: Optional[p
     w.add_uint32("adapter.heads", cfg.heads)
     if cfg.kind in (KIND_RESAMPLER, KIND_SEEDED):
         w.add_uint32("adapter.num_queries", cfg.num_queries)
+    if cfg.kind == KIND_MING:
+        w.add_string("adapter.kind", KIND_MING)
+        w.add_uint32("adapter.n_cap", cfg.n_cap)
+        w.add_uint32("adapter.cap_dim", cfg.cap_dim)
+        w.add_uint32("adapter.max_slots", cfg.max_slots)
+        w.add_uint32("adapter.seed_rank", cfg.seed_rank)
+        w.add_uint32("adapter.seed_vocab", cfg.seed_vocab)
+        w.add_uint32("adapter.vis_dim", cfg.vis_dim)
     w.add_uint32("adapter.trained_steps", int(ck["step"]))
     w.add_uint32("adapter.planned_steps", planned)
     w.add_string("adapter.checkpoint", checkpoint)
@@ -117,14 +138,20 @@ def export_adapter(project, pack, log, checkpoint: str = "best", out: Optional[p
         else:
             w.add_tensor("adapter." + name, a.astype(np.float16))
             n_f16 += 1
+    extras = pack.export_extra_tensors(project, log)          # e.g. the teacher tokenizer json (no adapter. prefix)
+    for name, a in extras.items():
+        w.add_tensor(name, a)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
     r = GGUFReader(str(tmp))
     names = {t.name for t in r.tensors}
-    assert len(r.tensors) == n_f16 + n_f32, "read-back tensor count mismatch"
-    if cfg.kind == KIND_TOKEN_VISION:
+    assert len(r.tensors) == n_f16 + n_f32 + len(extras), "read-back tensor count mismatch"
+    if cfg.kind == KIND_MING:
+        assert {"adapter.cap_query", "adapter.slot_query", "adapter.seed_embed.weight", "adapter.seed_proj.weight",
+                "adapter.vis_q.weight", "adapter.vis_in.weight", "adapter.out_cap.weight"} <= names, "ming layout"
+    elif cfg.kind == KIND_TOKEN_VISION:
         assert "adapter.query" not in names and {"adapter.skip.weight", "adapter.vision_proj.weight",
                                                  "adapter.vis_in.weight"} <= names, "vision-ext layout"
     elif cfg.kind == KIND_SEEDED:
@@ -152,8 +179,19 @@ def gguf_adapter_model(path: pathlib.Path):
     kv = {f.name: f.contents() for f in r.fields.values() if f.name.startswith("adapter.")}
     sd = {}
     for t in r.tensors:
+        if not t.name.startswith("adapter."):
+            continue                    # tokenizer_json and other companions
         shape = tuple(int(x) for x in reversed(t.shape))
         sd[t.name[len("adapter."):]] = torch.from_numpy(np.asarray(t.data).astype(np.float32).reshape(shape).copy())
+    if "cap_query" in sd:
+        cfg = AdapterConfig(in_dim=int(kv["adapter.in_dim"]), out_dim=int(kv["adapter.out_dim"]),
+                            width=int(kv["adapter.width"]), depth=int(kv["adapter.depth"]), num_queries=0, kind=KIND_MING,
+                            vis_dim=int(sd["vis_in.weight"].shape[1]), seed_vocab=int(sd["seed_embed.weight"].shape[0]),
+                            n_cap=int(sd["cap_query"].shape[0]), cap_dim=int(sd["out_cap.weight"].shape[0]),
+                            max_slots=int(sd["slot_query"].shape[0]), seed_rank=int(sd["seed_embed.weight"].shape[1]))
+        model = build_adapter(cfg)
+        model.load_state_dict(sd)
+        return model.eval(), cfg, kv
     resampler = "query" in sd
     seeded = resampler and "t5_embed.weight" in sd
     cfg = AdapterConfig(in_dim=int(kv["adapter.in_dim"]), out_dim=int(kv["adapter.out_dim"]),

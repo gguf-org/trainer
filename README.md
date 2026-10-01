@@ -21,6 +21,13 @@ model's original text encoder in the **ggk** engine. Four trainer packs ship:
   `pig_clip` + a 120-query resampler seeded with the T5 token ids (the
   original `trainer` recipe); the T5 *tokenizer* stays at inference, the
   encoder is never loaded.
+* **Ming-Image 0.1 (Design and Design-Layer)** — the 16B Ling-mini-2.0
+  Bailing-MoE MLLM is replaced by `pig_clip` + a resampler whose query bank is
+  the 256 caption rows plus one slot per Ling prompt token (seeded with a
+  frozen PCA of the Ling embedding table; the Ling *tokenizer* rides inside
+  the adapter GGUF). Editing and layer decomposition pair it with
+  `pig_ming_vision-f16.gguf`, the model's own Qwen2.5-VL tower exported by
+  the pack.
 
 Both packs train against `pig_clip-f16.gguf` (get it [here](https://huggingface.co/gguf-org/trainer/blob/main/pig_clip-f16.gguf) or under **Relesases**) - the student.
 
@@ -367,6 +374,55 @@ adapter with a vision extension is loaded (without one ggk refuses 2.1 edits,
 because it has no deepstack path). The engine and this pack were checked
 against each other: reference resize (pixel-index exact), template tokens and
 image slot positions for one and two references.
+
+## The Ming-Image pack
+
+Ming-Image 0.1 Design (and its Design-Layer sibling) conditions a Z-Image-style
+DiT on two outputs of its 16B **Ling-mini-2.0** MLLM: 256 *caption* tokens
+(learned query tokens appended to the prompt, read back after the thinker and
+refined by a 28-layer Qwen2 connector, 2560 wide) and one *direct* row per
+prompt token (hidden states 5 / 12 / 20 of every token — the system prefix,
+the input-image block, the text and the suffix — concatenated, RMSNorm +
+Linear to the DiT width 3840). The pack (`ming_image`) exports
+`pig_ming_adapter-f16.gguf`:
+
+```
+ggk diffuser engine -- --diffusion-model ming-image-0.1-design-nvfp4.gguf \
+    --vae pig_ming_image_vae_bf16.gguf --llm pig_clip-f16.gguf \
+    --llm-adapter pig_ming_adapter-f16.gguf -p "a sheep in sunglasses" \
+    --steps 12 --diffusion-fa --offload-to-cpu -o out.png
+# editing / layers: add --llm_vision pig_ming_vision-f16.gguf --ref-image ref.png
+```
+
+The Ling tokenizer is not the Qwen BPE, so a token-aligned adapter is
+impossible; the `ming_image` adapter kind is a resampler whose query bank is
+the 256 caption rows **plus one seeded slot per Ling prompt token**: the
+engine tokenizes the prompt with the Ling tokenizer (embedded in the adapter
+GGUF as `tokenizer_json`, exactly like the text encoder GGUF), so the DiT
+sees the token count and identity it was trained on. The seed is a frozen
+PCA of the Ling embedding table (`seed_table.pt`, rank `train.seed_rank`,
+default 512) through a trained linear, so unseen tokens still get a
+meaningful query. The student reads the raw prompt; the input image of an
+edit goes through the model's own Qwen2.5-VL tower + `linear_proj` (2048-d
+unit vectors) straight into the adapter — as extra key/value rows and as the
+query seed of its own `<imagePatch>` slots — never into the student. Both
+heads train on standardized targets; export folds the statistics into
+`out_cap` / `out_proj`.
+
+Materials: `inclusionAI/Ming-Image-0.1-Design` `mllm/` (~32 GB bf16, the
+thinker + the vision tower + the tokenizer), `connector/` (~5.8 GB) and
+`mlp/` (~120 MB). The Hugging Face repo ships weights only; the teacher is a
+forward-only PyTorch port of the reference modeling code (`ming_teacher.py`),
+placed either resident over the CUDA devices (~36 GiB) or streamed from RAM.
+The companion `pig_ming_vision-f16.gguf` (Output › "Also export the paired
+vision encoder GGUF", `export.export_vision`; `export.vision_quant` q8_0
+halves the ~1.3 GB) is written from the same snapshot after the adapter —
+text-to-image does not need it. Budget the corpus by teacher time: an image
+sample costs the thinker ~610 tokens against ~35 for a text prompt, so the
+defaults are 8k image + 16k text samples (94 train shards of 256; the first
+30k + 40k default came to 274 shards, over 18 h). Judge a run by
+`cos_centered` (mean of the caption and direct heads) and `rel_mse`.
+Needs ggk 0.7.7+.
 
 ## The PixArt / T5-XXL pack
 
